@@ -112,6 +112,13 @@ fn fetch_now_playing(config: &Config) -> Result<Option<NowPlaying>, String> {
     let body: Value =
         serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))?;
 
+    parse_now_playing(&body)
+}
+
+/// Parses a Subsonic `getNowPlaying` response into the current track.
+///
+/// Returns `Ok(None)` when nothing is playing.
+fn parse_now_playing(body: &Value) -> Result<Option<NowPlaying>, String> {
     let status = body["subsonic-response"]["status"].as_str().unwrap_or("");
     if status != "ok" {
         return Err(format!("Navidrome API status not ok: {}", status));
@@ -122,23 +129,30 @@ fn fetch_now_playing(config: &Config) -> Result<Option<NowPlaying>, String> {
         return Ok(None);
     }
 
-    // Navidrome reports the play state; older versions may omit it, in which
-    // case we optimistically assume the track is playing.
-    let playing = np["entry"]["state"]
+    // `nowPlaying.entry` is an array of tracks on Navidrome; some servers
+    // return a single object instead. Resolve the track first, then read the
+    // play state *from the track* — reading it from the array container always
+    // yields null, which made a paused track look like it was still playing.
+    let entry = match &np["entry"] {
+        Value::Array(tracks) => match tracks.first() {
+            Some(first) => first,
+            None => return Ok(None),
+        },
+        Value::Object(_) => &np["entry"],
+        _ => return Ok(None),
+    };
+
+    if entry["title"].is_null() {
+        return Ok(None);
+    }
+
+    // Older servers may omit `state`; assume playing in that case.
+    let playing = entry["state"]
         .as_str()
         .map(|s| s.eq_ignore_ascii_case("playing"))
         .unwrap_or(true);
 
-    let entry = &np["entry"];
-    if let Some(first) = entry.as_array().and_then(|a| a.first()) {
-        if !first["title"].is_null() {
-            return Ok(Some(track_from(first, playing)));
-        }
-    } else if !entry["title"].is_null() {
-        return Ok(Some(track_from(entry, playing)));
-    }
-
-    Ok(None)
+    Ok(Some(track_from(entry, playing)))
 }
 
 /// Thin wrapper around the Discord IPC client that reconnects on demand.
@@ -295,5 +309,77 @@ fn main() {
         }
 
         std::thread::sleep(Duration::from_secs(config.poll_interval));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn response(entry: Value) -> Value {
+        json!({ "subsonic-response": { "status": "ok", "nowPlaying": { "entry": entry } } })
+    }
+
+    fn entry(title: &str, state: &str) -> Value {
+        json!({
+            "id": "abc123",
+            "title": title,
+            "artist": "Artist",
+            "album": "Album",
+            "duration": 200,
+            "positionMs": 60_000,
+            "state": state,
+        })
+    }
+
+    #[test]
+    fn parses_playing_track() {
+        let track = parse_now_playing(&response(json!([entry("Song", "playing")])))
+            .unwrap()
+            .unwrap();
+        assert!(track.playing);
+        assert_eq!(track.title, "Song");
+        assert_eq!(track.elapsed, 60);
+        assert_eq!(track.duration, 200);
+    }
+
+    #[test]
+    fn detects_paused_track() {
+        // Regression: a paused track must NOT be reported as playing.
+        let track = parse_now_playing(&response(json!([entry("Song", "paused")])))
+            .unwrap()
+            .unwrap();
+        assert!(!track.playing);
+    }
+
+    #[test]
+    fn accepts_single_object_entry() {
+        let track = parse_now_playing(&response(entry("Song", "playing")))
+            .unwrap()
+            .unwrap();
+        assert!(track.playing);
+        assert_eq!(track.title, "Song");
+    }
+
+    #[test]
+    fn missing_state_defaults_to_playing() {
+        let mut e = entry("Song", "playing");
+        e.as_object_mut().unwrap().remove("state");
+        let track = parse_now_playing(&response(json!([e]))).unwrap().unwrap();
+        assert!(track.playing);
+    }
+
+    #[test]
+    fn empty_and_missing_now_playing_yield_none() {
+        assert!(parse_now_playing(&response(json!([]))).unwrap().is_none());
+        let body = json!({ "subsonic-response": { "status": "ok" } });
+        assert!(parse_now_playing(&body).unwrap().is_none());
+    }
+
+    #[test]
+    fn non_ok_status_is_an_error() {
+        let body = json!({ "subsonic-response": { "status": "failed" } });
+        assert!(parse_now_playing(&body).is_err());
     }
 }
