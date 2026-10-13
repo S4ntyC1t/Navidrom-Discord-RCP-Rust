@@ -109,4 +109,4 @@ systemctl --user enable --now navidrome-discord-rpc.service
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
