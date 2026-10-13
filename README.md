@@ -153,6 +153,18 @@ systemctl --user enable --now navidrome-discord-rpc.service
 > raise `POLL_INTERVAL` if you'd rather make fewer local API requests at the
 > cost of a slower status.
 
+## Disclosure
+
+This project was written with the help of an AI coding agent —
+**[OpenCode](https://opencode.ai)**, running the `mimo-v2.6-flash-free`
+model. The code, the tests, the bug fixes and the commit messages all came
+out of a conversation with it.
+
+Everything described under [Behaviour](#behaviour) was verified against a
+live Navidrome server and the Discord desktop client — but only on **Linux**.
+macOS, BSD and Windows have never been run (see [Platform](#platform)); the
+Windows case is reasoned about and explicitly rejected, not tested.
+
 ## License
 
 AGPL-3.0-or-later — see [LICENSE](LICENSE).
