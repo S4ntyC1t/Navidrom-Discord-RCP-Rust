@@ -147,11 +147,35 @@ systemctl --user enable --now navidrome-discord-rpc.service
   spaces or non-ASCII work.
 - A position reported past the end of a track is clamped, so the bar never
   renders an inverted window.
+- Two links sit under the status: one to [Navidrome](https://www.navidrome.org/)
+  itself — a small thank-you to the server this bridge exists to mirror — and
+  one to this repository. They are static, so they survive pausing.
 
 > **Responsiveness:** pause/seek are detected within `POLL_INTERVAL` seconds
 > (default `1`). Navidrome has no push API, so this is the cost of polling;
 > raise `POLL_INTERVAL` if you'd rather make fewer local API requests at the
 > cost of a slower status.
+
+## Troubleshooting
+
+**You can't see the buttons.** That is Discord's rule, not a bug here: buttons
+are [only rendered to *other* users](https://docs.discord.com/developers/discord-social-sdk/development-guides/setting-rich-presence)
+— the account that set the activity never sees them on itself. To check they
+work, look at your profile from a second account, or ask a friend.
+
+**The status vanishes, flickers, or shows someone else's.** Discord keeps a
+single activity slot and the *last* writer wins, so any other application with
+its own Rich Presence will overwrite this one whenever it updates. Games that
+set their presence once at launch are harmless; chatty clients are not. Check
+what else is connected:
+
+```bash
+ss -xap | grep discord-ipc
+```
+
+Then close that application, or disable its Discord integration. This bridge
+re-sends its activity on every poll, so it reclaims the slot within a second —
+but it cannot stop another client from taking it again.
 
 ## Disclosure
 

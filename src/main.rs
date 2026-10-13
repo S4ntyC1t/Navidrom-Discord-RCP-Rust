@@ -23,7 +23,9 @@ compile_error!(
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use discord_rich_presence::activity::{Activity, ActivityType, StatusDisplayType, Timestamps};
+use discord_rich_presence::activity::{
+    Activity, ActivityType, Button, StatusDisplayType, Timestamps,
+};
 use reqwest::blocking::Client;
 use serde_json::Value;
 
@@ -32,6 +34,16 @@ use serde_json::Value;
 /// and lets the bridge work out of the box. Override it with `DISCORD_CLIENT_ID`
 /// if you want the status to show under your own application name/icon.
 const DEFAULT_DISCORD_CLIENT_ID: &str = "1559471162419847198";
+
+/// Link to the Navidrome project itself.
+///
+/// Shown as a button under the status: a small thank-you to the server this
+/// whole bridge exists to mirror. Both URLs must be `https` — Discord rejects
+/// anything else.
+const NAVIDROME_LINK: &str = "https://www.navidrome.org/";
+
+/// Link to this bridge's source.
+const REPOSITORY_LINK: &str = "https://github.com/S4ntyC1t/navidrome-discord-rpc";
 
 const USAGE: &str = "\
 Required environment variables:
@@ -282,6 +294,17 @@ impl Presence {
         if let (Some(start), Some(end)) = (self.start, self.end) {
             activity = activity.timestamps(Timestamps::new().start(start).end(end));
         }
+
+        // Two links under the status: Navidrome itself, and this bridge.
+        // They are static, so they belong on the paused presence too.
+        //
+        // Discord shows buttons to *other* users only — the account that set
+        // the activity never sees them, which is documented behaviour, not a
+        // bug in this bridge.
+        activity = activity.buttons(vec![
+            Button::new("Navidrome", NAVIDROME_LINK),
+            Button::new("Source", REPOSITORY_LINK),
+        ]);
 
         activity
     }
@@ -993,5 +1016,51 @@ mod tests {
         // forever, and the status would silently stop updating.
         assert!(!HTTP_TIMEOUT.is_zero());
         assert!(HTTP_TIMEOUT <= Duration::from_secs(60));
+    }
+
+    /// The links attached under the status, as `(label, url)` pairs in payload
+    /// order.
+    fn links_in(json: &Value) -> Vec<(String, String)> {
+        json["buttons"]
+            .as_array()
+            .expect("activity carries buttons")
+            .iter()
+            .map(|b| {
+                (
+                    b["label"].as_str().unwrap_or_default().to_string(),
+                    b["url"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_presences_carry_the_two_links() {
+        // The links are static, so a paused status keeps them — only the bar
+        // and the timestamps go away.
+        let mut paused = playing_track();
+        paused.playing = false;
+
+        for (label, track) in [("playing", playing_track()), ("paused", paused)] {
+            let json =
+                serde_json::to_value(Presence::for_track(&track, 1_000).to_activity()).unwrap();
+            assert_eq!(
+                links_in(&json),
+                vec![
+                    ("Navidrome".to_string(), NAVIDROME_LINK.to_string()),
+                    ("Source".to_string(), REPOSITORY_LINK.to_string()),
+                ],
+                "{label} payload was {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_links_are_https() {
+        // Discord accepts nothing but https, and a rejected activity loses the
+        // entire status — not just the offending button.
+        for url in [NAVIDROME_LINK, REPOSITORY_LINK] {
+            assert!(url.starts_with("https://"), "{url} is not an https link");
+        }
     }
 }
