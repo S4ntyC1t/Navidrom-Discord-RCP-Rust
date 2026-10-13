@@ -61,6 +61,9 @@ NAVIDROME_PASSWORD=your_password \
 ./target/release/navidrome-discord-rpc
 ```
 
+`--help` prints the environment variables it reads, `--version` prints the
+build version. Both exit before touching the network.
+
 ## Configuration
 
 All configuration is via environment variables.
@@ -124,7 +127,13 @@ systemctl --user enable --now navidrome-discord-rpc.service
   short grace period so it doesn't flicker.
 - When playback really stops, the presence is cleared after that grace period.
 - If Discord restarts, the client reconnects automatically.
-- The log only prints when the presence actually changes.
+- The log only prints when the presence actually changes, and a repeated error
+  (Navidrome down, Discord closed) is logged once rather than once per poll.
+- Each request to Navidrome has a 10s timeout, so a hung server cannot freeze
+  the bridge. Credentials are percent-encoded, so passwords containing `&`,
+  spaces or non-ASCII work.
+- A position reported past the end of a track is clamped, so the bar never
+  renders an inverted window.
 
 > **Responsiveness:** pause/seek are detected within `POLL_INTERVAL` seconds
 > (default `1`). Navidrome has no push API, so this is the cost of polling;

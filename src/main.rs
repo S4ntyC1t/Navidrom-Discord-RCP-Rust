@@ -16,7 +16,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use discord_rich_presence::activity::{Activity, ActivityType, StatusDisplayType, Timestamps};
-use reqwest::blocking::get;
+use reqwest::blocking::Client;
 use serde_json::Value;
 
 /// Discord Application ID bundled with the project. It is a public identifier
@@ -107,15 +107,52 @@ fn track_from(entry: &Value, playing: bool) -> NowPlaying {
     }
 }
 
+/// Timeout for a single Navidrome request. Without it a hung server would
+/// block the polling loop forever and the status would silently freeze.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Percent-encodes a value for use inside a query string.
+///
+/// Credentials are interpolated straight into the URL, so a password
+/// containing `&`, `#`, `%`, a space or non-ASCII would silently corrupt the
+/// request (or leak into other parameters).
+fn encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
 /// Returns the currently playing track, `None` when nothing is playing,
 /// or an error string when the request itself failed.
-fn fetch_now_playing(config: &Config) -> Result<Option<NowPlaying>, String> {
+fn fetch_now_playing(client: &Client, config: &Config) -> Result<Option<NowPlaying>, String> {
+    // Tolerate a trailing slash in NAVIDROME_URL so we never build `//rest/...`.
+    let base = config.base_url.trim_end_matches('/');
     let url = format!(
         "{}/rest/getNowPlaying?u={}&p={}&v=1.16.1&c=navidrome-discord-rpc&f=json",
-        config.base_url, config.username, config.password
+        base,
+        encode_query(&config.username),
+        encode_query(&config.password),
     );
 
-    let resp = get(&url).map_err(|e| format!("HTTP error: {}", e))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("HTTP error: {}", e))?;
+
+    // A 401/500 body is HTML, not JSON; reporting the real status is far more
+    // useful than "JSON parse error" when the password is wrong.
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Navidrome returned HTTP {}", status));
+    }
+
     let text = resp.text().map_err(|e| format!("HTTP body error: {}", e))?;
     let body: Value =
         serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))?;
@@ -196,7 +233,12 @@ impl Presence {
 
         let (start, end, state) = if track.playing {
             let window = if track.duration > 0 {
-                let start = now - track.elapsed;
+                // Navidrome can briefly report a position past the end of the
+                // track while it is still transitioning. Anchoring to that would
+                // produce an inverted window (end before start), which Discord
+                // renders as an empty or nonsense bar.
+                let elapsed = track.elapsed.clamp(0, track.duration);
+                let start = now - elapsed;
                 (Some(start), Some(start + track.duration))
             } else {
                 // Length unknown: no progress bar possible.
@@ -540,12 +582,56 @@ struct Current {
 /// status immediately made the presence flicker, so we wait before clearing.
 const NOTHING_PLAYING_GRACE: i64 = 12;
 
+fn print_usage() {
+    println!(
+        "navidrome-discord-rpc {}\n\
+         \n\
+         Shows the track playing on Navidrome as Discord Rich Presence.\n\
+         \n\
+         Usage:\n\
+         \x20 navidrome-discord-rpc\n\
+         \n\
+         {}\n\
+         \n\
+         Flags:\n\
+         \x20 -h, --help     Show this help\n\
+         \x20 -V, --version  Show the version",
+        env!("CARGO_PKG_VERSION"),
+        USAGE
+    );
+}
+
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        Some("-h" | "--help") => {
+            print_usage();
+            return;
+        }
+        Some("-V" | "--version") => {
+            println!("navidrome-discord-rpc {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some(other) => {
+            eprintln!("Unknown argument: {}\n", other);
+            print_usage();
+            std::process::exit(2);
+        }
+        None => {}
+    }
+
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Configuration error: {}", e);
             eprintln!("\n{}", USAGE);
+            std::process::exit(2);
+        }
+    };
+
+    let client = match Client::builder().timeout(HTTP_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to build HTTP client: {}", e);
             std::process::exit(2);
         }
     };
@@ -560,11 +646,15 @@ fn main() {
     let mut current: Option<Current> = None;
     // When Navidrome stopped reporting a track (to apply the grace period).
     let mut missing_since: Option<i64> = None;
+    // Last error we printed, so a persistent failure is logged once instead of
+    // once per poll (which at 1s would bury the journal in seconds).
+    let mut last_error: Option<String> = None;
 
     loop {
-        match fetch_now_playing(&config) {
+        match fetch_now_playing(&client, &config) {
             Ok(Some(track)) => {
                 missing_since = None;
+                last_error = None;
 
                 // The presence must be (re)sent when the track or play state
                 // changes, and otherwise refreshed on a short interval so the
@@ -585,6 +675,8 @@ fn main() {
 
                 match rpc.set_activity(activity) {
                     Ok(echo) => {
+                        last_error = None;
+
                         // Discord echoes the activity it stored. Comparing that
                         // against what we sent catches the case we could not see
                         // before: timestamps we deliberately omitted coming back
@@ -615,13 +707,15 @@ fn main() {
                         current = Some(Current { key });
                     }
                     Err(e) => {
-                        eprintln!("Failed to update presence: {}", e);
+                        report_error(&mut last_error, "presence", &e);
                         // Force a fresh attempt (and reconnect) next tick.
                         current = None;
                     }
                 }
             }
             Ok(None) => {
+                last_error = None;
+
                 // Navidrome returns an empty `nowPlaying` for a moment between
                 // tracks (and when playback truly stops). Hold the last track
                 // briefly so the presence doesn't flicker, then clear it.
@@ -637,12 +731,24 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("Failed to fetch now playing info: {}", e);
+                report_error(&mut last_error, "fetch", &e);
             }
         }
 
         std::thread::sleep(Duration::from_secs(config.poll_interval));
     }
+}
+
+/// Logs `err` unless it is identical to the one already reported.
+///
+/// With a one-second poll, Navidrome being briefly unreachable would otherwise
+/// write the same line once a second and drown out real changes.
+fn report_error(last: &mut Option<String>, what: &str, err: &str) {
+    if last.as_deref() == Some(err) {
+        return;
+    }
+    eprintln!("Failed to {} (will retry): {}", what, err);
+    *last = Some(err.to_string());
 }
 
 #[cfg(test)]
@@ -799,5 +905,85 @@ mod tests {
     fn default_client_id_is_the_bundled_application() {
         assert!(!DEFAULT_DISCORD_CLIENT_ID.is_empty());
         assert!(DEFAULT_DISCORD_CLIENT_ID.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn query_encoding_keeps_safe_chars_and_escapes_the_rest() {
+        // A password with `&` would otherwise split the query and leak a second
+        // parameter; `#` would truncate the URL at a fragment.
+        assert_eq!(encode_query("plain-Pass_1.0~x"), "plain-Pass_1.0~x");
+        assert_eq!(encode_query("a&b=c?d#e"), "a%26b%3Dc%3Fd%23e");
+        assert_eq!(encode_query("100% /"), "100%25%20%2F");
+        assert_eq!(encode_query("пароль"), "%D0%BF%D0%B0%D1%80%D0%BE%D0%BB%D1%8C");
+        assert_eq!(encode_query(""), "");
+    }
+
+    #[test]
+    fn query_encoding_round_trips_like_urlencoding() {
+        // Cross-check against the percent-decoding rules: every byte we emit
+        // must be a valid `%XX` escape or an unreserved character.
+        for input in ["a b", "p@ss!", "ü/ñ", "x=y&z"] {
+            let encoded = encode_query(input);
+            assert_eq!(encoded.len() % 2, 1, "odd length for {:?}", input);
+            let mut bytes = Vec::new();
+            let mut chars = encoded.chars();
+            while let Some(c) = chars.next() {
+                if c == '%' {
+                    let hi = chars.next().expect("hex digit");
+                    let lo = chars.next().expect("hex digit");
+                    bytes.push(u8::from_str_radix(&format!("{}{}", hi, lo), 16).expect("hex"));
+                } else {
+                    bytes.push(c as u8);
+                }
+            }
+            assert_eq!(bytes, input.as_bytes(), "mismatch for {:?}", input);
+        }
+    }
+
+    #[test]
+    fn position_past_the_end_does_not_invert_the_window() {
+        // Navidrome can briefly report a position past the track length while
+        // transitioning; that must not produce end < start.
+        let mut track = playing_track();
+        track.duration = 100;
+        track.elapsed = 137;
+        let p = Presence::for_track(&track, 1_000);
+        assert_eq!(p.start, Some(900));
+        assert_eq!(p.end, Some(1_000));
+        assert!(p.end.unwrap() > p.start.unwrap());
+    }
+
+    #[test]
+    fn negative_position_is_clamped_to_the_start() {
+        let mut track = playing_track();
+        track.duration = 100;
+        track.elapsed = -5;
+        let p = Presence::for_track(&track, 1_000);
+        assert_eq!(p.start, Some(1_000));
+        assert_eq!(p.end, Some(1_100));
+    }
+
+    #[test]
+    fn a_repeated_error_is_logged_only_once() {
+        let mut last: Option<String> = None;
+        report_error(&mut last, "fetch", "HTTP error: connection refused");
+        assert_eq!(last.as_deref(), Some("HTTP error: connection refused"));
+
+        // The same failure on the next poll must stay silent.
+        let before = last.clone();
+        report_error(&mut last, "fetch", "HTTP error: connection refused");
+        assert_eq!(last, before);
+
+        // A *different* failure must break through.
+        report_error(&mut last, "fetch", "HTTP error: timed out");
+        assert_eq!(last.as_deref(), Some("HTTP error: timed out"));
+    }
+
+    #[test]
+    fn http_timeout_is_bounded() {
+        // An unbounded client would let a hung Navidrome freeze the loop
+        // forever, and the status would silently stop updating.
+        assert!(!HTTP_TIMEOUT.is_zero());
+        assert!(HTTP_TIMEOUT <= Duration::from_secs(60));
     }
 }
