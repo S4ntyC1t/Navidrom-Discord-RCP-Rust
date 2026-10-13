@@ -13,6 +13,14 @@
 //! | `DISCORD_CLIENT_ID`  | no       | built-in application    |
 //! | `POLL_INTERVAL`      | no       | `1` (second)            |
 
+#[cfg(not(unix))]
+compile_error!(
+    "navidrome-discord-rpc supports Unix-like systems only (Linux, macOS, BSD): \
+     it talks to Discord over a Unix domain socket, and Windows does not have \
+     those — it uses named pipes instead, which this transport does not implement \
+     yet. See the Platform section of README.md."
+);
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use discord_rich_presence::activity::{Activity, ActivityType, StatusDisplayType, Timestamps};

@@ -24,6 +24,19 @@ socket. It is a single small Rust binary with no external services.
 - Discord running locally (the desktop client).
 - Rust 1.85+ to build (edition 2024).
 
+## Platform
+
+**Unix-like systems only (Linux, macOS, BSD).** The bridge talks to Discord
+over a Unix domain socket (`$XDG_RUNTIME_DIR/discord-ipc-N`). Windows has no
+Unix sockets — it uses named pipes (`\\?\pipe\discord-ipc-N`) instead — so the
+build fails there with an explicit `compile_error!` rather than a confusing
+type error.
+
+Nothing else about the program is Unix-specific: Navidrome is reached over
+HTTP, and the config is plain environment variables. Windows support would
+mean adding a named-pipe transport alongside the existing one; contributions
+welcome.
+
 ## Setup
 
 ### 1. Discord application (optional)
