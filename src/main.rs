@@ -215,6 +215,27 @@ impl Presence {
             end,
         }
     }
+
+    /// Builds the Discord activity that is sent over IPC.
+    ///
+    /// `SET_ACTIVITY` *assigns* the whole activity (it replaces the previous
+    /// one, which is why clearing works by sending `activity: null`), so a
+    /// paused presence omits `timestamps` entirely — the stale bar is dropped
+    /// rather than silently kept, because the field is simply absent from the
+    /// payload (the crate skips `None`).
+    fn to_activity(&self) -> Activity<'_> {
+        let mut activity = Activity::new()
+            .activity_type(ActivityType::Listening)
+            .status_display_type(StatusDisplayType::Details)
+            .details(self.details.clone())
+            .state(self.state.clone());
+
+        if let (Some(start), Some(end)) = (self.start, self.end) {
+            activity = activity.timestamps(Timestamps::new().start(start).end(end));
+        }
+
+        activity
+    }
 }
 
 /// Thin wrapper around the Discord IPC client that reconnects on demand.
@@ -320,21 +341,11 @@ fn main() {
                 let now = now_secs();
                 let changed = current.as_ref().map(|c| c.key != key).unwrap_or(true);
 
-                // Discord derives the bar from `now - start`, so we resend every
-                // tick: while playing this keeps the bar in sync with Navidrome,
-                // and while paused (Navidrome freezes `positionMs`) it keeps
-                // `start` moving with the clock so the bar stays frozen.
+                // Resend every tick: while playing this keeps the bar in sync with
+                // Navidrome; while paused the presence simply carries no
+                // timestamps, so there is nothing for Discord to advance.
                 let presence = Presence::for_track(&track, now);
-
-                let mut activity = Activity::new()
-                    .activity_type(ActivityType::Listening)
-                    .status_display_type(StatusDisplayType::Details)
-                    .details(presence.details.clone())
-                    .state(presence.state.clone());
-
-                if let (Some(start), Some(end)) = (presence.start, presence.end) {
-                    activity = activity.timestamps(Timestamps::new().start(start).end(end));
-                }
+                let activity = presence.to_activity();
 
                 match rpc.set_activity(activity) {
                     Ok(()) => {
@@ -483,6 +494,27 @@ mod tests {
         assert!(p.state.contains("Artist — Album"));
         assert_eq!(p.start, None);
         assert_eq!(p.end, None);
+    }
+
+    #[test]
+    fn paused_activity_payload_omits_timestamps() {
+        // Proof that the stale bar is *removed*: the serialized activity sent to
+        // Discord on pause has no `timestamps` key at all. Since SET_ACTIVITY
+        // assigns the whole activity, omitting the field drops the bar instead
+        // of leaving Discord to keep advancing the previous one.
+        let mut track = playing_track();
+        track.playing = false;
+        let json = serde_json::to_value(Presence::for_track(&track, 1_000).to_activity()).unwrap();
+        assert!(json.get("timestamps").is_none(), "payload was {json}");
+        assert_eq!(json["type"], 2); // Listening
+    }
+
+    #[test]
+    fn playing_activity_payload_has_timestamps() {
+        let json = serde_json::to_value(Presence::for_track(&playing_track(), 1_000).to_activity())
+            .unwrap();
+        assert_eq!(json["timestamps"]["start"], 940);
+        assert_eq!(json["timestamps"]["end"], 1_140);
     }
 
     #[test]
