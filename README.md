@@ -71,7 +71,7 @@ All configuration is via environment variables.
 | `NAVIDROME_PASSWORD` | yes      | —                       | Navidrome password                |
 | `NAVIDROME_URL`      | no       | `http://localhost:4533` | Navidrome base URL                |
 | `DISCORD_CLIENT_ID`  | no       | built-in application    | Discord Application ID to show as |
-| `POLL_INTERVAL`      | no       | `3`                     | Poll interval, in seconds         |
+| `POLL_INTERVAL`      | no       | `1`                     | Poll interval, in seconds         |
 
 ## Run as a systemd user service
 
@@ -116,6 +116,10 @@ systemctl --user enable --now navidrome-discord-rpc.service
   progress bar stops moving (Discord has no native paused state — it always
   renders the time as "now minus start" — so omitting the timestamps is the only
   way to keep it still). The pause stays visible via the marker.
+- Every reply Discord sends is read back and matched to its request, and the
+  activity Discord echoes is compared against the one that was sent. If Discord
+  ever stored timestamps we deliberately omitted (i.e. kept a stale bar), the
+  bridge logs it instead of silently pretending the update landed.
 - Between tracks Navidrome briefly reports nothing; the presence is held for a
   short grace period so it doesn't flicker.
 - When playback really stops, the presence is cleared after that grace period.
@@ -123,9 +127,9 @@ systemctl --user enable --now navidrome-discord-rpc.service
 - The log only prints when the presence actually changes.
 
 > **Responsiveness:** pause/seek are detected within `POLL_INTERVAL` seconds
-> (default `3`). Navidrome has no push API, so this is the cost of polling;
-> lower `POLL_INTERVAL` (e.g. `1`) for a snappier status at the cost of more
-> local API requests.
+> (default `1`). Navidrome has no push API, so this is the cost of polling;
+> raise `POLL_INTERVAL` if you'd rather make fewer local API requests at the
+> cost of a slower status.
 
 ## License
 
