@@ -26,14 +26,22 @@ socket. It is a single small Rust binary with no external services.
 
 ## Setup
 
-### 1. Create a Discord application
+### 1. Discord application (optional)
+
+The bridge ships with a built-in Discord Application ID, so it works out of the
+box. If you want the status to show under **your own** application name and icon
+instead, create one:
 
 1. Open <https://discord.com/developers/applications> → **New Application**.
 2. Give it a name (this is what shows up in the status, e.g. `Navidrome`).
-3. Copy the **Application ID** from *General Information* — this is your
+3. Copy the **Application ID** from *General Information* and set it as
    `DISCORD_CLIENT_ID`.
 4. *(Optional)* Upload an icon under **Rich Presence → Art Assets** for a nicer
    status picture.
+
+> The Application ID is a **public identifier** (like a bot's user ID) — it is
+> not a secret. The client *secret* is never used by this program, so nothing
+> sensitive is bundled or needed.
 
 ### 2. Build
 
@@ -59,10 +67,10 @@ All configuration is via environment variables.
 
 | Variable             | Required | Default                 | Description                       |
 |----------------------|----------|-------------------------|-----------------------------------|
-| `DISCORD_CLIENT_ID`  | yes      | —                       | Discord Application ID            |
 | `NAVIDROME_USER`     | yes      | —                       | Navidrome username                |
 | `NAVIDROME_PASSWORD` | yes      | —                       | Navidrome password                |
 | `NAVIDROME_URL`      | no       | `http://localhost:4533` | Navidrome base URL                |
+| `DISCORD_CLIENT_ID`  | no       | built-in application    | Discord Application ID to show as |
 | `POLL_INTERVAL`      | no       | `3`                     | Poll interval, in seconds         |
 
 ## Run as a systemd user service
@@ -80,7 +88,8 @@ ExecStart=%h/navidrome-discord-rpc/target/release/navidrome-discord-rpc
 Environment=NAVIDROME_URL=http://localhost:4533
 Environment=NAVIDROME_USER=your_user
 Environment=NAVIDROME_PASSWORD=your_password
-Environment=DISCORD_CLIENT_ID=123456789012345678
+# Optional: only if you use your own Discord application.
+# Environment=DISCORD_CLIENT_ID=123456789012345678
 Restart=on-failure
 
 [Install]
@@ -102,7 +111,8 @@ systemctl --user enable --now navidrome-discord-rpc.service
 
 - **Listening** activity type with a progress bar that Discord advances itself
   from the track's `start`/`end` timestamps.
-- Pausing clears the status; resuming restores it.
+- **Paused** tracks are marked explicitly (`⏸ Paused`) and lose the progress
+  bar, so a pause never looks like playback.
 - When nothing is playing, the presence is cleared.
 - If Discord restarts, the client reconnects automatically.
 - The log only prints when the track actually changes (plus periodic re-asserts).

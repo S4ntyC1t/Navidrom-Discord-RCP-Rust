@@ -3,14 +3,14 @@
 //! Polls Navidrome's Subsonic API for the track that is currently playing and
 //! mirrors it into Discord Rich Presence over the local Discord IPC socket.
 //!
-//! Configuration is provided entirely through environment variables:
+//! Configuration is provided through environment variables:
 //!
 //! | Variable             | Required | Default                 |
 //! |----------------------|----------|-------------------------|
-//! | `DISCORD_CLIENT_ID`  | yes      | —                       |
 //! | `NAVIDROME_USER`     | yes      | —                       |
 //! | `NAVIDROME_PASSWORD` | yes      | —                       |
 //! | `NAVIDROME_URL`      | no       | `http://localhost:4533` |
+//! | `DISCORD_CLIENT_ID`  | no       | built-in application    |
 //! | `POLL_INTERVAL`      | no       | `3` (seconds)           |
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,14 +20,20 @@ use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use reqwest::blocking::get;
 use serde_json::Value;
 
+/// Discord Application ID bundled with the project. It is a public identifier
+/// (not a secret — there is no client secret involved), so it is safe to ship
+/// and lets the bridge work out of the box. Override it with `DISCORD_CLIENT_ID`
+/// if you want the status to show under your own application name/icon.
+const DEFAULT_DISCORD_CLIENT_ID: &str = "1559471162419847198";
+
 const USAGE: &str = "\
 Required environment variables:
-  DISCORD_CLIENT_ID   Application ID from https://discord.com/developers/applications
   NAVIDROME_USER      Your Navidrome username
   NAVIDROME_PASSWORD  Your Navidrome password
 
 Optional:
   NAVIDROME_URL       Navidrome base URL       (default http://localhost:4533)
+  DISCORD_CLIENT_ID   Override the built-in Discord Application ID
   POLL_INTERVAL       Poll interval in seconds (default 3)";
 
 /// Everything the bridge needs to run, read once at startup.
@@ -53,7 +59,10 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:4533".to_string()),
             username: required("NAVIDROME_USER")?,
             password: required("NAVIDROME_PASSWORD")?,
-            client_id: required("DISCORD_CLIENT_ID")?,
+            client_id: std::env::var("DISCORD_CLIENT_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_DISCORD_CLIENT_ID.to_string()),
             poll_interval: std::env::var("POLL_INTERVAL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -153,6 +162,54 @@ fn parse_now_playing(body: &Value) -> Result<Option<NowPlaying>, String> {
         .unwrap_or(true);
 
     Ok(Some(track_from(entry, playing)))
+}
+
+/// The presence fields we compute for a track, kept separate from the Discord
+/// `Activity` type so the logic is unit-testable.
+#[derive(Debug, Clone, PartialEq)]
+struct Presence {
+    details: String,
+    state: String,
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+impl Presence {
+    /// Builds the presence for a track. A paused track gets an explicit
+    /// "⏸ Paused" marker and no timestamps (so Discord does not show a moving
+    /// progress bar); a playing track gets a `start`/`end` window that Discord
+    /// advances itself.
+    fn for_track(track: &NowPlaying, now: i64) -> Self {
+        let credits = format!("{} — {}", track.artist, track.album).trim_end_matches(" — ").to_string();
+        let credits = if credits.is_empty() {
+            "Unknown artist".to_string()
+        } else {
+            credits
+        };
+
+        if track.playing {
+            let (start, end) = if track.duration > 0 {
+                let start = now - track.elapsed;
+                (Some(start), Some(start + track.duration))
+            } else {
+                // Playing, but length unknown: no progress bar possible.
+                (None, None)
+            };
+            Self {
+                details: track.title.clone(),
+                state: credits,
+                start,
+                end,
+            }
+        } else {
+            Self {
+                details: track.title.clone(),
+                state: format!("⏸ Paused · {}", credits),
+                start: None,
+                end: None,
+            }
+        }
+    }
 }
 
 /// Thin wrapper around the Discord IPC client that reconnects on demand.
@@ -257,20 +314,15 @@ fn main() {
 
                 if changed || stale {
                     let now = now_secs();
-                    let (start, end) = if track.playing && track.duration > 0 {
-                        let start = now - track.elapsed;
-                        (Some(start), Some(start + track.duration))
-                    } else {
-                        (None, None)
-                    };
+                    let presence = Presence::for_track(&track, now);
 
                     let mut activity = Activity::new()
                         .activity_type(ActivityType::Listening)
                         .status_display_type(StatusDisplayType::Details)
-                        .details(track.title.clone())
-                        .state(format!("{} — {}", track.artist, track.album));
+                        .details(presence.details.clone())
+                        .state(presence.state.clone());
 
-                    if let (Some(start), Some(end)) = (start, end) {
+                    if let (Some(start), Some(end)) = (presence.start, presence.end) {
                         activity = activity.timestamps(Timestamps::new().start(start).end(end));
                     }
 
@@ -381,5 +433,63 @@ mod tests {
     fn non_ok_status_is_an_error() {
         let body = json!({ "subsonic-response": { "status": "failed" } });
         assert!(parse_now_playing(&body).is_err());
+    }
+
+    fn playing_track() -> NowPlaying {
+        NowPlaying {
+            track_id: "abc".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            elapsed: 60,
+            duration: 200,
+            playing: true,
+        }
+    }
+
+    #[test]
+    fn playing_presence_has_a_running_window() {
+        let p = Presence::for_track(&playing_track(), 1_000);
+        assert_eq!(p.details, "Song");
+        assert_eq!(p.state, "Artist — Album");
+        assert_eq!(p.start, Some(940)); // now - elapsed
+        assert_eq!(p.end, Some(1140)); // start + duration
+    }
+
+    #[test]
+    fn paused_presence_is_marked_and_has_no_timestamps() {
+        // Regression: a paused track must be visually distinguishable from a
+        // playing one (explicit marker) and must not show a moving progress bar.
+        let mut track = playing_track();
+        track.playing = false;
+        let p = Presence::for_track(&track, 1_000);
+        assert!(p.state.starts_with("⏸ Paused"), "state was {:?}", p.state);
+        assert!(p.state.contains("Artist — Album"));
+        assert_eq!(p.start, None);
+        assert_eq!(p.end, None);
+    }
+
+    #[test]
+    fn playing_without_duration_has_no_window() {
+        let mut track = playing_track();
+        track.duration = 0;
+        let p = Presence::for_track(&track, 1_000);
+        assert_eq!(p.start, None);
+        assert_eq!(p.end, None);
+    }
+
+    #[test]
+    fn missing_artist_and_album_falls_back() {
+        let mut track = playing_track();
+        track.artist = String::new();
+        track.album = String::new();
+        let p = Presence::for_track(&track, 1_000);
+        assert_eq!(p.state, "Unknown artist");
+    }
+
+    #[test]
+    fn default_client_id_is_the_bundled_application() {
+        assert!(!DEFAULT_DISCORD_CLIENT_ID.is_empty());
+        assert!(DEFAULT_DISCORD_CLIENT_ID.chars().all(|c| c.is_ascii_digit()));
     }
 }
