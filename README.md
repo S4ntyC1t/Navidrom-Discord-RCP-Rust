@@ -109,9 +109,9 @@ systemctl --user enable --now navidrome-discord-rpc.service
 
 ## Behaviour
 
-- **Listening** activity type with a progress bar that Discord advances itself
-  from the track's `start`/`end` timestamps, refreshed every few seconds so the
-  bar stays in sync with Navidrome (seeks and pauses are picked up quickly).
+- **Listening** activity type with a progress bar that Discord advances itself.
+  The presence is re-sent on every poll, so the bar stays in sync with
+  Navidrome (seeks and buffering show up within one poll interval).
 - **Paused** tracks are marked `⏸ Paused` and their progress slider *freezes* at
   the paused position (it is not removed), so a pause stays visible.
 - Between tracks Navidrome briefly reports nothing; the presence is held for a
@@ -119,6 +119,11 @@ systemctl --user enable --now navidrome-discord-rpc.service
 - When playback really stops, the presence is cleared after that grace period.
 - If Discord restarts, the client reconnects automatically.
 - The log only prints when the presence actually changes.
+
+> **Responsiveness:** pause/seek are detected within `POLL_INTERVAL` seconds
+> (default `3`). Navidrome has no push API, so this is the cost of polling;
+> lower `POLL_INTERVAL` (e.g. `1`) for a snappier status at the cost of more
+> local API requests.
 
 ## License
 
