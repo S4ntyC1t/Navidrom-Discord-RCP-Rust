@@ -175,39 +175,49 @@ struct Presence {
 }
 
 impl Presence {
-    /// Builds the presence for a track. A paused track gets an explicit
-    /// "⏸ Paused" marker and no timestamps (so Discord does not show a moving
-    /// progress bar); a playing track gets a `start`/`end` window that Discord
-    /// advances itself.
-    fn for_track(track: &NowPlaying, now: i64) -> Self {
-        let credits = format!("{} — {}", track.artist, track.album).trim_end_matches(" — ").to_string();
+    /// Builds the presence for a track.
+    ///
+    /// A playing track gets a `start`/`end` window anchored to Navidrome's real
+    /// `positionMs`, which Discord advances itself.
+    ///
+    /// A paused track keeps the same window (so the slider stays put instead of
+    /// vanishing) but is marked `⏸ Paused`. `frozen_start` is the anchor from a
+    /// previous refresh; reusing it keeps the slider frozen at the paused
+    /// position instead of drifting forward as wall-clock time passes.
+    fn for_track(track: &NowPlaying, now: i64, frozen_start: Option<i64>) -> Self {
+        let credits = format!("{} — {}", track.artist, track.album)
+            .trim_end_matches(" — ")
+            .to_string();
         let credits = if credits.is_empty() {
             "Unknown artist".to_string()
         } else {
             credits
         };
 
-        if track.playing {
-            let (start, end) = if track.duration > 0 {
-                let start = now - track.elapsed;
-                (Some(start), Some(start + track.duration))
+        let (start, end) = if track.duration > 0 {
+            let start = if track.playing {
+                now - track.elapsed
             } else {
-                // Playing, but length unknown: no progress bar possible.
-                (None, None)
+                // Freeze the slider at the paused position.
+                frozen_start.unwrap_or(now - track.elapsed)
             };
-            Self {
-                details: track.title.clone(),
-                state: credits,
-                start,
-                end,
-            }
+            (Some(start), Some(start + track.duration))
         } else {
-            Self {
-                details: track.title.clone(),
-                state: format!("⏸ Paused · {}", credits),
-                start: None,
-                end: None,
-            }
+            // Length unknown: no progress bar possible.
+            (None, None)
+        };
+
+        let state = if track.playing {
+            credits
+        } else {
+            format!("⏸ Paused · {}", credits)
+        };
+
+        Self {
+            details: track.title.clone(),
+            state,
+            start,
+            end,
         }
     }
 }
@@ -272,10 +282,20 @@ impl Rpc {
 struct Current {
     key: String,
     sent_at: i64,
+    /// Slider anchor captured when a paused track was first shown, so the
+    /// progress bar freezes instead of drifting with wall-clock time.
+    frozen_start: Option<i64>,
 }
 
-/// How often to re-assert an unchanged presence (Discord can drop it).
-const REASSERT_AFTER: i64 = 30;
+/// How often to (re)send an unchanged *playing* activity. Resending keeps the
+/// progress bar in sync with Navidrome (which reports the real `positionMs`),
+/// so seeking and buffering are reflected quickly.
+const ACTIVITY_UPDATE_INTERVAL: i64 = 10;
+
+/// How long to keep showing the last track after Navidrome reports nothing.
+/// Navidrome briefly returns an empty `nowPlaying` between tracks; clearing the
+/// status immediately made the presence flicker, so we wait before clearing.
+const NOTHING_PLAYING_GRACE: i64 = 12;
 
 fn main() {
     let config = match Config::from_env() {
@@ -295,26 +315,42 @@ fn main() {
 
     let mut rpc = Rpc::new(config.client_id.clone());
     let mut current: Option<Current> = None;
+    // When Navidrome stopped reporting a track (to apply the grace period).
+    let mut missing_since: Option<i64> = None;
 
     loop {
         match fetch_now_playing(&config) {
             Ok(Some(track)) => {
-                // Presence only needs to change when the track (or play state)
-                // changes; Discord ticks the progress bar on its own.
+                missing_since = None;
+
+                // The presence must be (re)sent when the track or play state
+                // changes, and otherwise refreshed on a short interval so the
+                // progress bar tracks Navidrome's real position (seeks, pauses).
                 let key = format!(
                     "{}|{}|{}|{}|{}",
                     track.track_id, track.title, track.artist, track.album, track.playing
                 );
 
-                let stale = current
-                    .as_ref()
-                    .map(|c| now_secs() - c.sent_at >= REASSERT_AFTER)
-                    .unwrap_or(false);
+                let now = now_secs();
                 let changed = current.as_ref().map(|c| c.key != key).unwrap_or(true);
+                let due = current
+                    .as_ref()
+                    .map(|c| now - c.sent_at >= ACTIVITY_UPDATE_INTERVAL)
+                    .unwrap_or(true);
 
-                if changed || stale {
-                    let now = now_secs();
-                    let presence = Presence::for_track(&track, now);
+                if changed || due {
+                    // For a paused track, reuse the anchor captured when it was
+                    // first shown so the slider stays frozen; for a playing
+                    // track, anchor to Navidrome's live position.
+                    let frozen_start = if track.playing {
+                        None
+                    } else if !changed {
+                        current.as_ref().and_then(|c| c.frozen_start)
+                    } else {
+                        Some(now - track.elapsed)
+                    };
+
+                    let presence = Presence::for_track(&track, now, frozen_start);
 
                     let mut activity = Activity::new()
                         .activity_type(ActivityType::Listening)
@@ -336,6 +372,7 @@ fn main() {
                             current = Some(Current {
                                 key,
                                 sent_at: now,
+                                frozen_start: presence.start,
                             });
                         }
                         Err(e) => {
@@ -347,7 +384,13 @@ fn main() {
                 }
             }
             Ok(None) => {
-                if current.is_some() {
+                // Navidrome returns an empty `nowPlaying` for a moment between
+                // tracks (and when playback truly stops). Hold the last track
+                // briefly so the presence doesn't flicker, then clear it.
+                let now = now_secs();
+                let since = *missing_since.get_or_insert(now);
+
+                if current.is_some() && now - since >= NOTHING_PLAYING_GRACE {
                     match rpc.clear_activity() {
                         Ok(()) => println!("Nothing playing — presence cleared"),
                         Err(e) => eprintln!("Failed to clear presence: {}", e),
@@ -449,7 +492,7 @@ mod tests {
 
     #[test]
     fn playing_presence_has_a_running_window() {
-        let p = Presence::for_track(&playing_track(), 1_000);
+        let p = Presence::for_track(&playing_track(), 1_000, None);
         assert_eq!(p.details, "Song");
         assert_eq!(p.state, "Artist — Album");
         assert_eq!(p.start, Some(940)); // now - elapsed
@@ -457,25 +500,42 @@ mod tests {
     }
 
     #[test]
-    fn paused_presence_is_marked_and_has_no_timestamps() {
+    fn paused_presence_is_marked_and_keeps_the_slider_frozen() {
         // Regression: a paused track must be visually distinguishable from a
-        // playing one (explicit marker) and must not show a moving progress bar.
+        // playing one, and the progress slider must stay put (same start/end
+        // window as a playing track) instead of disappearing.
         let mut track = playing_track();
         track.playing = false;
-        let p = Presence::for_track(&track, 1_000);
+        let p = Presence::for_track(&track, 1_000, Some(940));
         assert!(p.state.starts_with("⏸ Paused"), "state was {:?}", p.state);
         assert!(p.state.contains("Artist — Album"));
-        assert_eq!(p.start, None);
-        assert_eq!(p.end, None);
+        assert_eq!(p.start, Some(940));
+        assert_eq!(p.end, Some(1140));
+    }
+
+    #[test]
+    fn paused_slider_does_not_advance_between_refreshes() {
+        // A paused track is re-sent periodically; the anchor must be reused so
+        // the slider freezes instead of drifting forward with wall-clock time.
+        let mut track = playing_track();
+        track.playing = false;
+        let first = Presence::for_track(&track, 1_000, None).start;
+        let later = Presence::for_track(&track, 1_010, first).start;
+        assert_eq!(first, later);
     }
 
     #[test]
     fn playing_without_duration_has_no_window() {
         let mut track = playing_track();
         track.duration = 0;
-        let p = Presence::for_track(&track, 1_000);
+        let p = Presence::for_track(&track, 1_000, None);
         assert_eq!(p.start, None);
         assert_eq!(p.end, None);
+    }
+
+    #[test]
+    fn nothing_playing_grace_is_positive() {
+        const { assert!(NOTHING_PLAYING_GRACE > 0) };
     }
 
     #[test]
@@ -483,7 +543,7 @@ mod tests {
         let mut track = playing_track();
         track.artist = String::new();
         track.album = String::new();
-        let p = Presence::for_track(&track, 1_000);
+        let p = Presence::for_track(&track, 1_000, None);
         assert_eq!(p.state, "Unknown artist");
     }
 
