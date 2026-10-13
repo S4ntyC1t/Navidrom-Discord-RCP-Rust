@@ -177,14 +177,14 @@ struct Presence {
 impl Presence {
     /// Builds the presence for a track.
     ///
-    /// Discord derives the progress bar from `now - start`, so:
+    /// Discord draws the progress bar from `now - start` and has no "paused"
+    /// state, so a timestamp can never be made to *stand still*: sending one
+    /// keeps the bar moving. Therefore:
     ///
-    /// * **playing** — anchor to Navidrome's live `positionMs`; Discord advances
-    ///   the bar itself.
-    /// * **paused** — Navidrome freezes `positionMs` at the paused position, so
-    ///   anchoring to it makes Discord hold the bar there. Because we resend
-    ///   every tick, `start` keeps moving with the clock and the bar truly stays
-    ///   put (sending it once would let it drift).
+    /// * **playing** — send a `start`/`end` window anchored to Navidrome's live
+    ///   `positionMs`; Discord advances the bar itself.
+    /// * **paused** — send **no timestamps at all**, so nothing moves; the state
+    ///   text carries the `⏸ Paused` marker instead.
     fn for_track(track: &NowPlaying, now: i64) -> Self {
         let credits = format!("{} — {}", track.artist, track.album)
             .trim_end_matches(" — ")
@@ -195,18 +195,17 @@ impl Presence {
             credits
         };
 
-        let (start, end) = if track.duration > 0 {
-            let start = now - track.elapsed;
-            (Some(start), Some(start + track.duration))
+        let (start, end, state) = if track.playing {
+            let window = if track.duration > 0 {
+                let start = now - track.elapsed;
+                (Some(start), Some(start + track.duration))
+            } else {
+                // Length unknown: no progress bar possible.
+                (None, None)
+            };
+            (window.0, window.1, credits)
         } else {
-            // Length unknown: no progress bar possible.
-            (None, None)
-        };
-
-        let state = if track.playing {
-            credits
-        } else {
-            format!("⏸ Paused · {}", credits)
+            (None, None, format!("⏸ Paused · {}", credits))
         };
 
         Self {
@@ -473,33 +472,17 @@ mod tests {
     }
 
     #[test]
-    fn paused_presence_is_marked() {
-        // Regression: a paused track must be visually distinguishable from a
-        // playing one (explicit marker) and must still show the slider.
+    fn paused_presence_is_marked_and_has_no_timestamps() {
+        // Discord cannot freeze a timestamp (it always renders `now - start`),
+        // so the only way to stop the bar from moving on pause is to omit the
+        // timestamps entirely and rely on the state marker instead.
         let mut track = playing_track();
         track.playing = false;
         let p = Presence::for_track(&track, 1_000);
         assert!(p.state.starts_with("⏸ Paused"), "state was {:?}", p.state);
         assert!(p.state.contains("Artist — Album"));
-        assert_eq!(p.start, Some(940));
-        assert_eq!(p.end, Some(1140));
-    }
-
-    #[test]
-    fn paused_slider_stays_put_when_the_clock_advances() {
-        // Navidrome freezes `positionMs` while paused, so `start` must move
-        // forward with the clock: Discord draws progress as `now - start`, so a
-        // moving `start` is exactly what keeps the slider frozen at the paused
-        // position instead of advancing toward the end.
-        let mut track = playing_track();
-        track.playing = false; // elapsed stays 60s, as Navidrome keeps it frozen
-        let first = Presence::for_track(&track, 1_000);
-        let later = Presence::for_track(&track, 1_060);
-        assert_eq!(first.start, Some(940));
-        assert_eq!(later.start, Some(1_000));
-        // The displayed position (now - start) is unchanged in both cases.
-        assert_eq!(1_000 - first.start.unwrap(), 60);
-        assert_eq!(1_060 - later.start.unwrap(), 60);
+        assert_eq!(p.start, None);
+        assert_eq!(p.end, None);
     }
 
     #[test]
