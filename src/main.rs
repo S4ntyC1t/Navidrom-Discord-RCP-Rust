@@ -5,13 +5,18 @@
 //!
 //! Configuration is provided through environment variables:
 //!
-//! | Variable             | Required | Default                 |
-//! |----------------------|----------|-------------------------|
-//! | `NAVIDROME_USER`     | yes      | —                       |
-//! | `NAVIDROME_PASSWORD` | yes      | —                       |
-//! | `NAVIDROME_URL`      | no       | `http://localhost:4533` |
-//! | `DISCORD_CLIENT_ID`  | no       | built-in application    |
-//! | `POLL_INTERVAL`      | no       | `1` (second)            |
+//! | Variable               | Required | Default                 |
+//! |------------------------|----------|-------------------------|
+//! | `NAVIDROME_USER`       | yes      | —                       |
+//! | `NAVIDROME_PASSWORD`   | yes      | —                       |
+//! | `NAVIDROME_URL`        | no       | `http://localhost:4533` |
+//! | `NAVIDROME_PUBLIC_URL` | no       | — (no cover art)        |
+//! | `DISCORD_CLIENT_ID`    | no       | built-in application    |
+//! | `POLL_INTERVAL`        | no       | `1` (second)            |
+//!
+//! Authentication uses the Subsonic token scheme (`t`/`s`), never `p=`: the
+//! password never leaves this process, so it can never end up in a URL, in the
+//! journal, or in whatever sits between us and Navidrome.
 
 #[cfg(not(unix))]
 compile_error!(
@@ -21,10 +26,11 @@ compile_error!(
      yet. See the Platform section of README.md."
 );
 
+use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use discord_rich_presence::activity::{
-    Activity, ActivityType, Button, StatusDisplayType, Timestamps,
+    Activity, ActivityType, Assets, Button, StatusDisplayType, Timestamps,
 };
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -51,15 +57,25 @@ Required environment variables:
   NAVIDROME_PASSWORD  Your Navidrome password
 
 Optional:
-  NAVIDROME_URL       Navidrome base URL       (default http://localhost:4533)
-  DISCORD_CLIENT_ID   Override the built-in Discord Application ID
-  POLL_INTERVAL       Poll interval in seconds (default 1)";
+  NAVIDROME_URL        Navidrome base URL       (default http://localhost:4533)
+  NAVIDROME_PUBLIC_URL Public origin of Navidrome, e.g. https://music.example.com.
+                       Required for cover art: Discord fetches images from its
+                       own servers, so a localhost URL is unreachable for it.
+  DISCORD_CLIENT_ID    Override the built-in Discord Application ID
+  POLL_INTERVAL        Poll interval in seconds (default 1)";
 
 /// Everything the bridge needs to run, read once at startup.
 struct Config {
     base_url: String,
     username: String,
     password: String,
+    /// Public origin Navidrome is reachable at, if the operator set one.
+    ///
+    /// Discord downloads presence images from its own servers, so a URL on
+    /// `localhost` (or any private address) is useless to it. When Navidrome
+    /// hands back such a URL, we rewrite its origin to this one; without it
+    /// cover art is skipped rather than sent broken.
+    public_url: Option<String>,
     client_id: String,
     poll_interval: u64,
 }
@@ -73,11 +89,43 @@ impl Config {
             }
         }
 
+        // Normalised once at startup: no trailing slash, and no accidental
+        // `base//rest/...` later.
+        let base_url = std::env::var("NAVIDROME_URL")
+            .unwrap_or_else(|_| "http://localhost:4533".to_string())
+            .trim_end_matches('/')
+            .to_string();
+
+        let public_url = std::env::var("NAVIDROME_PUBLIC_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                if !(v.starts_with("http://") || v.starts_with("https://")) {
+                    return Err(format!(
+                        "NAVIDROME_PUBLIC_URL must be an absolute http(s) URL, got: {}",
+                        v
+                    ));
+                }
+                if v.starts_with("http://") {
+                    // Not fatal — some setups do serve plain http — but it is
+                    // worth saying out loud, because Discord may refuse to load
+                    // a mixed-content image and the symptom would just be a
+                    // missing cover with no explanation.
+                    eprintln!(
+                        "Warning: NAVIDROME_PUBLIC_URL is http:// — Discord may refuse \
+                         to load it. Prefer https://"
+                    );
+                }
+                Ok(v)
+            })
+            .transpose()?;
+
         Ok(Self {
-            base_url: std::env::var("NAVIDROME_URL")
-                .unwrap_or_else(|_| "http://localhost:4533".to_string()),
+            base_url,
             username: required("NAVIDROME_USER")?,
             password: required("NAVIDROME_PASSWORD")?,
+            public_url,
             client_id: std::env::var("DISCORD_CLIENT_ID")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
@@ -133,9 +181,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Percent-encodes a value for use inside a query string.
 ///
-/// Credentials are interpolated straight into the URL, so a password
-/// containing `&`, `#`, `%`, a space or non-ASCII would silently corrupt the
-/// request (or leak into other parameters).
+/// Everything we interpolate is user- or server-supplied: a username, a track
+/// id, a salt. Characters like `&`, `#`, `%`, a space or non-ASCII would
+/// silently corrupt the request (or bleed into other parameters).
 fn encode_query(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -149,25 +197,79 @@ fn encode_query(value: &str) -> String {
     out
 }
 
-/// Returns the currently playing track, `None` when nothing is playing,
-/// or an error string when the request itself failed.
-fn fetch_now_playing(client: &Client, config: &Config) -> Result<Option<NowPlaying>, String> {
-    // Tolerate a trailing slash in NAVIDROME_URL so we never build `//rest/...`.
-    let base = config.base_url.trim_end_matches('/');
-    let url = format!(
-        "{}/rest/getNowPlaying?u={}&p={}&v=1.16.1&c=navidrome-discord-rpc&f=json",
-        base,
-        encode_query(&config.username),
-        encode_query(&config.password),
-    );
+/// A fresh nonce for a single request.
+///
+/// The Subsonic spec asks for a random alphanumeric string of at least 12
+/// characters; 16 hex chars from the kernel CSPRNG is comfortably inside that.
+/// The salt is not a secret — its only job is to make every `t` unique — so a
+/// failed `/dev/urandom` read degrades to a time-derived value rather than
+/// taking the bridge down.
+fn random_salt() -> String {
+    let mut buf = [0u8; 8];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+
+    if !ok {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        buf = (nanos as u64).to_le_bytes();
+    }
+
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Credentials for one Subsonic request.
+///
+/// Navidrome accepts either a plaintext password (`p=`) or a token pair
+/// (`t=`/`s=`). We only ever build the token: `t` is
+/// `md5(password + salt)` with a fresh salt each request, so **the password
+/// itself never leaves this process** — not into a URL, not into the journal,
+/// not into anything between us and Navidrome.
+///
+/// md5 is not a choice we made: the Subsonic spec mandates it for this
+/// challenge-response, and here it authenticates without disclosing the
+/// secret rather than protecting one at rest.
+fn auth_params(config: &Config) -> String {
+    auth_params_with_salt(config, &random_salt())
+}
+
+/// Same, with the salt supplied — so the digest can be checked against a
+/// published md5 vector instead of only against md5 itself.
+fn auth_params_with_salt(config: &Config, salt: &str) -> String {
+    let digest = format!("{:x}", md5::compute(format!("{}{}", config.password, salt)));
+    format!("u={}&t={}&s={}", encode_query(&config.username), digest, salt)
+}
+
+/// Builds a URL for one Subsonic endpoint. `extra` is query content we add
+/// ourselves, such as `id=<track>`.
+fn subsonic_url(config: &Config, endpoint: &str, extra: &str) -> String {
+    let sep = if extra.is_empty() { "" } else { "&" };
+    format!(
+        "{}/rest/{}?{}{}{}&v=1.16.1&c=navidrome-discord-rpc&f=json",
+        config.base_url,
+        endpoint,
+        auth_params(config),
+        sep,
+        extra,
+    )
+}
+
+/// Performs a Subsonic GET and returns the parsed `subsonic-response` object.
+///
+/// Reporting the HTTP status first matters: a 401/500 body is HTML, not JSON,
+/// and "Navidrome returned HTTP 401" is far more useful than "JSON parse
+/// error" when the credentials are wrong.
+fn subsonic_get(client: &Client, config: &Config, endpoint: &str, extra: &str) -> Result<Value, String> {
+    let url = subsonic_url(config, endpoint, extra);
 
     let resp = client
         .get(&url)
         .send()
         .map_err(|e| format!("HTTP error: {}", e))?;
 
-    // A 401/500 body is HTML, not JSON; reporting the real status is far more
-    // useful than "JSON parse error" when the password is wrong.
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("Navidrome returned HTTP {}", status));
@@ -177,6 +279,23 @@ fn fetch_now_playing(client: &Client, config: &Config) -> Result<Option<NowPlayi
     let body: Value =
         serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))?;
 
+    let response = &body["subsonic-response"];
+    let status = response["status"].as_str().unwrap_or("");
+    if status != "ok" {
+        // Surface Navidrome's own message — "Wrong username or password" beats
+        // "status not ok" by a mile when debugging.
+        let code = response["error"]["code"].as_i64().unwrap_or(0);
+        let message = response["error"]["message"].as_str().unwrap_or("no message given");
+        return Err(format!("Navidrome API error {}: {}", code, message));
+    }
+
+    Ok(body)
+}
+
+/// Returns the currently playing track, `None` when nothing is playing,
+/// or an error string when the request itself failed.
+fn fetch_now_playing(client: &Client, config: &Config) -> Result<Option<NowPlaying>, String> {
+    let body = subsonic_get(client, config, "getNowPlaying", "")?;
     parse_now_playing(&body)
 }
 
@@ -220,6 +339,115 @@ fn parse_now_playing(body: &Value) -> Result<Option<NowPlaying>, String> {
     Ok(Some(track_from(entry, playing)))
 }
 
+/// Splits `http://host:port/path?query` into its origin and the rest.
+fn split_origin(url: &str) -> Option<(&str, &str)> {
+    let scheme_end = url.find("://")?;
+    let host_start = scheme_end + 3;
+    let host_end = url[host_start..]
+        .find('/')
+        .map(|i| host_start + i)
+        .unwrap_or(url.len());
+    Some((&url[..host_end], &url[host_end..]))
+}
+
+/// True when `origin` names a host Discord's servers could not reach — a
+/// loopback address, a private range, or an mDNS name. Discord downloads
+/// presence images itself, so `localhost` or `192.168.1.42` would simply
+/// never resolve for it.
+fn is_locally_only(origin: &str) -> bool {
+    let after_scheme = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
+    // Drop userinfo, then port — and mind IPv6 brackets (`[::1]:4533`).
+    let host = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let host = host.to_ascii_lowercase();
+
+    let in_172_private = host
+        .strip_prefix("172.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|octet| octet.parse::<u8>().ok())
+        .is_some_and(|octet| (16..=31).contains(&octet));
+
+    host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host == "0.0.0.0"
+        || host == "::1"
+        || host == "ip6-localhost"
+        || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+        || in_172_private
+        || host.starts_with("fc")
+        || host.starts_with("fd")
+}
+
+/// Turns a cover URL Navidrome produced into one Discord can actually fetch.
+///
+/// Navidrome builds these URLs from the Host header of the request that asked
+/// for them — and we ask it on `localhost` — so what comes back is unreachable
+/// for Discord, which fetches presence images from its own servers. If the
+/// operator declared `NAVIDROME_PUBLIC_URL` we swap that origin in; otherwise
+/// we keep the URL only when Navidrome already returned a publicly reachable
+/// one (it will have a `BaseUrl` configured), and drop it silently when not.
+fn public_image_url(raw: &str, public_url: Option<&str>) -> Option<String> {
+    let (origin, rest) = split_origin(raw)?;
+
+    if let Some(public) = public_url {
+        return Some(format!("{}{}", public, rest));
+    }
+
+    if is_locally_only(origin) {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+/// Resolves a cover image for a track.
+///
+/// Returns `Ok(None)` when there is genuinely no artwork to show, and `Err`
+/// when the request failed — the caller logs the latter and stays quiet about
+/// the former.
+///
+/// `getAlbumInfo` takes an album **or song** id, so this keys off the track id
+/// we already hold rather than `albumId`, which the `nowPlaying` payload does
+/// not promise to carry. The URLs it returns (`/share/img/<JWT>`) are signed
+/// but **credential-free** — no username, no password, no token — which is
+/// exactly what may be handed to a third party like Discord.
+fn fetch_cover(client: &Client, config: &Config, track_id: &str) -> Result<Option<String>, String> {
+    if track_id.is_empty() {
+        return Ok(None);
+    }
+
+    let body = subsonic_get(
+        client,
+        config,
+        "getAlbumInfo",
+        &format!("id={}", encode_query(track_id)),
+    )?;
+
+    // Prefer the largest variant: it is a square PNG of a few tens of KB, and
+    // Discord downscales it anyway. Fall back to medium/small so an album with
+    // only a thumbnail still shows something.
+    let raw = body["subsonic-response"]["albumInfo"]
+        .get("largeImageUrl")
+        .or_else(|| body["subsonic-response"]["albumInfo"].get("mediumImageUrl"))
+        .or_else(|| body["subsonic-response"]["albumInfo"].get("smallImageUrl"))
+        .and_then(Value::as_str);
+
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    Ok(public_image_url(raw, config.public_url.as_deref()))
+}
+
 /// The presence fields we compute for a track, kept separate from the Discord
 /// `Activity` type so the logic is unit-testable.
 #[derive(Debug, Clone, PartialEq)]
@@ -228,6 +456,14 @@ struct Presence {
     state: String,
     start: Option<i64>,
     end: Option<i64>,
+    /// Album name, used as the tooltip on the cover.
+    album: String,
+    /// Cover image Discord is able to fetch, when one was resolved.
+    ///
+    /// Kept out of `for_track` because resolving it costs a request of its
+    /// own, which the polling loop does once per track rather than once a
+    /// second — see `fetch_cover`.
+    cover: Option<String>,
 }
 
 impl Presence {
@@ -274,6 +510,8 @@ impl Presence {
             state,
             start,
             end,
+            album: track.album.clone(),
+            cover: None,
         }
     }
 
@@ -293,6 +531,18 @@ impl Presence {
 
         if let (Some(start), Some(end)) = (self.start, self.end) {
             activity = activity.timestamps(Timestamps::new().start(start).end(end));
+        }
+
+        // The album cover, with the album name as its hover text. Discord
+        // fetches `large_image` from its own servers, so this URL only ever
+        // holds something reachable from outside this machine — `fetch_cover`
+        // is what guarantees that, and simply finds nothing when it cannot.
+        if let Some(cover) = &self.cover {
+            let mut assets = Assets::new().large_image(cover.clone());
+            if !self.album.is_empty() {
+                assets = assets.large_text(self.album.clone());
+            }
+            activity = activity.assets(assets);
         }
 
         // Two links under the status: Navidrome itself, and this bridge.
@@ -605,7 +855,14 @@ impl Rpc {
 
 /// The last presence we pushed, so we only log real changes.
 struct Current {
+    /// Everything that requires a resend when it changes — `playing` included,
+    /// so pausing re-sends the presence.
     key: String,
+    /// Identity of the track the stored `cover` belongs to. Kept separate from
+    /// `key` on purpose: pausing must not spend another request re-resolving
+    /// art that has not changed — only switching tracks should.
+    track_key: String,
+    cover: Option<String>,
 }
 
 /// How long to keep showing the last track after Navidrome reports nothing.
@@ -672,6 +929,15 @@ fn main() {
     println!("  User: {}", config.username);
     println!("  Poll interval: {}s", config.poll_interval);
     println!("  Discord client_id: {}", config.client_id);
+    match &config.public_url {
+        // Being honest here: without this, covers silently never appear, which
+        // looks exactly like a broken feature.
+        Some(public) => println!("  Cover art: through {}", public),
+        None => println!(
+            "  Cover art: only if Navidrome is publicly reachable \
+             (set NAVIDROME_PUBLIC_URL to enable it from a local server)"
+        ),
+    }
 
     let mut rpc = Rpc::new(config.client_id.clone());
     let mut current: Option<Current> = None;
@@ -690,18 +956,50 @@ fn main() {
                 // The presence must be (re)sent when the track or play state
                 // changes, and otherwise refreshed on a short interval so the
                 // progress bar tracks Navidrome's real position (seeks, pauses).
-                let key = format!(
-                    "{}|{}|{}|{}|{}",
-                    track.track_id, track.title, track.artist, track.album, track.playing
+                let track_key = format!(
+                    "{}|{}|{}|{}",
+                    track.track_id, track.title, track.artist, track.album
                 );
+                let key = format!("{}|{}", track_key, track.playing);
 
                 let now = now_secs();
                 let changed = current.as_ref().map(|c| c.key != key).unwrap_or(true);
 
+                // Artwork only changes with the track, so it is looked up once
+                // per track and cached — paying a request every second for a
+                // static image would be pure waste. Pausing reuses the stored
+                // one, because the cover has not changed.
+                let need_cover = current
+                    .as_ref()
+                    .map(|c| c.track_key != track_key)
+                    .unwrap_or(true);
+                let cover = if need_cover {
+                    match fetch_cover(&client, &config, &track.track_id) {
+                        Ok(cover) => cover,
+                        Err(e) => {
+                            // Logged directly rather than through `report_error`:
+                            // this runs once per track instead of once per
+                            // second, so there is no journal flood to guard
+                            // against — and it genuinely will not be retried
+                            // until the next track, so "will retry" would be a
+                            // lie. It must also not touch `last_error`, which
+                            // belongs to the presence exchange.
+                            eprintln!(
+                                "Cover art lookup failed for {:?} (no image this track): {}",
+                                track.title, e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    current.as_ref().and_then(|c| c.cover.clone())
+                };
+
                 // Resend every tick: while playing this keeps the bar in sync with
                 // Navidrome; while paused the presence simply carries no
                 // timestamps, so there is nothing for Discord to advance.
-                let presence = Presence::for_track(&track, now);
+                let mut presence = Presence::for_track(&track, now);
+                presence.cover = cover.clone();
                 let activity = presence.to_activity();
 
                 match rpc.set_activity(activity) {
@@ -731,11 +1029,24 @@ fn main() {
                         if changed {
                             let state = if track.playing { "playing" } else { "paused" };
                             println!(
-                                "Presence set: {} — {} [{}] ({} / {})",
-                                track.title, track.artist, state, track.elapsed, track.duration
+                                "Presence set: {} — {} [{}] ({} / {}){}",
+                                track.title,
+                                track.artist,
+                                state,
+                                track.elapsed,
+                                track.duration,
+                                if presence.cover.is_some() {
+                                    " +cover"
+                                } else {
+                                    ""
+                                }
                             );
                         }
-                        current = Some(Current { key });
+                        current = Some(Current {
+                            key,
+                            track_key,
+                            cover,
+                        });
                     }
                     Err(e) => {
                         report_error(&mut last_error, "presence", &e);
@@ -940,8 +1251,10 @@ mod tests {
 
     #[test]
     fn query_encoding_keeps_safe_chars_and_escapes_the_rest() {
-        // A password with `&` would otherwise split the query and leak a second
-        // parameter; `#` would truncate the URL at a fragment.
+        // A value with `&` would otherwise split the query and inject a second
+        // parameter; `#` would truncate the URL at a fragment. This now guards
+        // usernames, salts and track ids — the password itself never reaches a
+        // query at all (see `the_password_never_reaches_a_url`).
         assert_eq!(encode_query("plain-Pass_1.0~x"), "plain-Pass_1.0~x");
         assert_eq!(encode_query("a&b=c?d#e"), "a%26b%3Dc%3Fd%23e");
         assert_eq!(encode_query("100% /"), "100%25%20%2F");
@@ -1062,5 +1375,163 @@ mod tests {
         for url in [NAVIDROME_LINK, REPOSITORY_LINK] {
             assert!(url.starts_with("https://"), "{url} is not an https link");
         }
+    }
+
+    // ---- Authentication -------------------------------------------------
+
+    fn auth_config(password: &str) -> Config {
+        Config {
+            base_url: "http://localhost:4533".into(),
+            username: "S4ntyC1t".into(),
+            password: password.into(),
+            public_url: None,
+            client_id: DEFAULT_DISCORD_CLIENT_ID.into(),
+            poll_interval: 1,
+        }
+    }
+
+    #[test]
+    fn the_password_never_reaches_a_url() {
+        // The whole point of token auth: nothing built for the wire may carry
+        // the password, nor the `p=` parameter that used to hold it.
+        let config = auth_config("s3cr3t-password");
+        for url in [
+            subsonic_url(&config, "getNowPlaying", ""),
+            subsonic_url(&config, "getAlbumInfo", "id=abc123"),
+        ] {
+            assert!(!url.contains("s3cr3t-password"), "password leaked: {url}");
+            assert!(
+                !url.contains("?p=") && !url.contains("&p="),
+                "plaintext password param: {url}"
+            );
+            assert!(url.contains("u=S4ntyC1t"), "username missing: {url}");
+            assert!(url.contains("&t="), "token missing: {url}");
+            assert!(url.contains("&s="), "salt missing: {url}");
+        }
+    }
+
+    #[test]
+    fn the_token_is_md5_of_password_then_salt() {
+        // md5("message digest") is a published RFC 1321 vector, reached here
+        // with password "message " and salt "digest". It pins the algorithm
+        // *and* the concatenation order: swapping to salt-then-password yields
+        // 0c5b0b38d25e3867f3625344c1a8a38d, and Navidrome answers that with
+        // "Wrong username or password" — an error that points nowhere near the
+        // actual mistake.
+        let config = auth_config("message ");
+        assert!(
+            auth_params_with_salt(&config, "digest")
+                .contains("t=f96b697d7cb7938d525a2f31aaf161d0"),
+            "digest computed over the wrong input order"
+        );
+    }
+
+    #[test]
+    fn salts_meet_the_subsonic_rules() {
+        // "Random alphanumeric of at least 12 characters", and distinct per
+        // request — a repeated salt would mean a repeated token, which is the
+        // replayable thing we are rotating in the first place.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let salt = random_salt();
+            assert!(salt.len() >= 12, "salt too short: {salt}");
+            assert!(
+                salt.chars().all(|c| c.is_ascii_alphanumeric()),
+                "salt is not alphanumeric: {salt}"
+            );
+            assert!(seen.insert(salt.clone()), "salt reused: {salt}");
+        }
+    }
+
+    // ---- Cover art ------------------------------------------------------
+
+    #[test]
+    fn a_configured_public_origin_replaces_the_local_one() {
+        // Navidrome builds these from the Host header of *our* request, which
+        // is localhost, so the origin has to be swapped before Discord ever
+        // sees it. Only the origin changes — the signed path must survive
+        // intact, since the JWT inside it is what authorises the fetch.
+        let raw = "http://localhost:4533/share/img/eyJhbGciOiJ9.sig?size=600";
+        assert_eq!(
+            public_image_url(raw, Some("https://music.example.com")).as_deref(),
+            Some("https://music.example.com/share/img/eyJhbGciOiJ9.sig?size=600")
+        );
+    }
+
+    #[test]
+    fn a_url_discord_cannot_reach_is_dropped() {
+        // Discord fetches presence images from its own servers. Handing it
+        // something only this machine resolves buys a broken image with no
+        // explanation attached, which is worse than showing no cover at all.
+        for raw in [
+            "http://localhost:4533/share/img/tok?size=600",
+            "http://127.0.0.1:4533/share/img/tok",
+            "http://10.1.2.3:4533/share/img/tok",
+            "http://192.168.1.42:4533/share/img/tok",
+            "http://172.20.0.7:4533/share/img/tok",
+            "http://nas.local:4533/share/img/tok",
+            "http://[::1]:4533/share/img/tok",
+        ] {
+            assert_eq!(public_image_url(raw, None), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_already_public_navidrome_url_is_left_alone() {
+        // A Navidrome with a BaseUrl configured returns a usable URL straight
+        // away; forcing a rewrite there would break a working setup.
+        let raw = "https://music.example.com/share/img/tok?size=600";
+        assert_eq!(public_image_url(raw, None).as_deref(), Some(raw));
+        // Even when a public origin is configured, the path is preserved.
+        assert_eq!(
+            public_image_url(raw, Some("https://other.example.com")).as_deref(),
+            Some("https://other.example.com/share/img/tok?size=600")
+        );
+    }
+
+    #[test]
+    fn the_cover_reaches_the_activity() {
+        let mut presence = Presence::for_track(&playing_track(), 1_000);
+        presence.cover = Some("https://music.example.com/share/img/tok?size=600".into());
+
+        let json = serde_json::to_value(presence.to_activity()).unwrap();
+
+        assert_eq!(
+            json["assets"]["large_image"].as_str(),
+            Some("https://music.example.com/share/img/tok?size=600"),
+            "payload was {json}"
+        );
+        // Hovering the cover shows which album it belongs to.
+        assert_eq!(json["assets"]["large_text"].as_str(), Some("Album"));
+    }
+
+    #[test]
+    fn without_a_cover_no_assets_are_sent() {
+        // An empty or bogus `assets` object would put a broken frame under an
+        // otherwise fine status.
+        let json =
+            serde_json::to_value(Presence::for_track(&playing_track(), 1_000).to_activity())
+                .unwrap();
+        assert!(json.get("assets").is_none(), "payload was {json}");
+    }
+
+    #[test]
+    fn a_paused_presence_keeps_the_cover() {
+        // Only the progress bar stops on pause — the artwork is static and
+        // belongs there either way.
+        let mut track = playing_track();
+        track.playing = false;
+
+        let mut presence = Presence::for_track(&track, 1_000);
+        presence.cover = Some("https://music.example.com/share/img/tok".into());
+
+        let json = serde_json::to_value(presence.to_activity()).unwrap();
+
+        assert!(json.get("timestamps").is_none(), "payload was {json}");
+        assert_eq!(
+            json["assets"]["large_image"].as_str(),
+            Some("https://music.example.com/share/img/tok")
+        );
+        assert!(json["state"].as_str().unwrap().starts_with("⏸ Paused"));
     }
 }

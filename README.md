@@ -81,13 +81,45 @@ build version. Both exit before touching the network.
 
 All configuration is via environment variables.
 
-| Variable             | Required | Default                 | Description                       |
-|----------------------|----------|-------------------------|-----------------------------------|
-| `NAVIDROME_USER`     | yes      | —                       | Navidrome username                |
-| `NAVIDROME_PASSWORD` | yes      | —                       | Navidrome password                |
-| `NAVIDROME_URL`      | no       | `http://localhost:4533` | Navidrome base URL                |
-| `DISCORD_CLIENT_ID`  | no       | built-in application    | Discord Application ID to show as |
-| `POLL_INTERVAL`      | no       | `1`                     | Poll interval, in seconds         |
+| Variable               | Required | Default                 | Description                                            |
+|------------------------|----------|-------------------------|--------------------------------------------------------|
+| `NAVIDROME_USER`       | yes      | —                       | Navidrome username                                     |
+| `NAVIDROME_PASSWORD`   | yes      | —                       | Navidrome password                                     |
+| `NAVIDROME_URL`        | no       | `http://localhost:4533` | Navidrome base URL                                     |
+| `NAVIDROME_PUBLIC_URL` | no       | —                       | Public origin of Navidrome — required for cover art    |
+| `DISCORD_CLIENT_ID`    | no       | built-in application    | Discord Application ID to show as                      |
+| `POLL_INTERVAL`        | no       | `1`                     | Poll interval, in seconds                              |
+
+### Credentials
+
+The password is **never put on the wire**. Requests carry the Subsonic token
+pair instead — `t=md5(password + salt)` with a fresh random salt per request —
+so nothing between this bridge and Navidrome, and no line in the journal, ever
+sees the password itself.
+
+This is why `NAVIDROME_PASSWORD` still exists as a variable: it is the secret
+the token is derived from, held in memory and nowhere else.
+
+### Cover art
+
+Discord downloads presence images **from its own servers**, so it cannot reach
+your `localhost`. Set `NAVIDROME_PUBLIC_URL` to the origin Navidrome is
+reachable at from the internet, and the bridge rewrites the cover URLs it is
+handed to that origin:
+
+```ini
+Environment=NAVIDROME_PUBLIC_URL=https://music.example.com
+```
+
+Leave it unset and cover art stays off — the bridge will say so at startup
+rather than silently sending an image nobody can load.
+
+> **Keep the credentials out of those URLs.** Navidrome's cover endpoints
+> (`/rest/getCoverArt`) put the username and password into the query string,
+> which would hand your account to Discord along with the artwork. This bridge
+> uses `/rest/getAlbumInfo` instead, which returns `/share/img/<JWT>` — a
+> signed, **credential-free** URL. Do not "fix" a missing cover by pointing it
+> back at `getCoverArt`.
 
 ## Run as a systemd user service
 
@@ -104,6 +136,8 @@ ExecStart=%h/navidrome-discord-rpc/target/release/navidrome-discord-rpc
 Environment=NAVIDROME_URL=http://localhost:4533
 Environment=NAVIDROME_USER=your_user
 Environment=NAVIDROME_PASSWORD=your_password
+# Optional: cover art, once Navidrome is reachable from the internet.
+# Environment=NAVIDROME_PUBLIC_URL=https://music.example.com
 # Optional: only if you use your own Discord application.
 # Environment=DISCORD_CLIENT_ID=123456789012345678
 Restart=on-failure
@@ -143,8 +177,14 @@ systemctl --user enable --now navidrome-discord-rpc.service
 - The log only prints when the presence actually changes, and a repeated error
   (Navidrome down, Discord closed) is logged once rather than once per poll.
 - Each request to Navidrome has a 10s timeout, so a hung server cannot freeze
-  the bridge. Credentials are percent-encoded, so passwords containing `&`,
-  spaces or non-ASCII work.
+  the bridge. Everything interpolated into a query — username, salt, track id —
+  is percent-encoded, so values containing `&`, spaces or non-ASCII work.
+- **Album art** is the presence's large image, with the album name on hover.
+  The URL comes from `/rest/getAlbumInfo`, which serves a signed
+  `/share/img/<JWT>` with **no credentials embedded** — Navidrome's
+  `getCoverArt` would otherwise put your username and password into a URL that
+  is handed to a third party. Artwork is resolved once per track and cached, so
+  pausing costs no extra request.
 - A position reported past the end of a track is clamped, so the bar never
   renders an inverted window.
 - Two links sit under the status: one to [Navidrome](https://www.navidrome.org/)
@@ -162,6 +202,27 @@ systemctl --user enable --now navidrome-discord-rpc.service
 are [only rendered to *other* users](https://docs.discord.com/developers/discord-social-sdk/development-guides/setting-rich-presence)
 — the account that set the activity never sees them on itself. To check they
 work, look at your profile from a second account, or ask a friend.
+
+**No album art.** Three things must line up, and the startup log tells you
+which is missing:
+
+1. `NAVIDROME_PUBLIC_URL` must be set to an origin Discord can reach from the
+   internet. Without it the bridge logs
+   `Cover art: only if Navidrome is publicly reachable` and sends no image —
+   deliberately, since a `localhost` URL would just fail to load.
+2. It must be **https**. Discord may refuse a plain `http://` image, and the
+   symptom is a silently missing cover.
+3. The album must have artwork at all. Navidrome reports this as an empty
+   `albumInfo`, and the bridge skips it rather than sending a broken frame.
+
+If art is configured but a track reports
+`Cover art lookup failed …`, the request itself is failing — check that
+`NAVIDROME_URL` is right and the account may read the album.
+
+> **Do not "fix" this by pointing at `/rest/getCoverArt`.** That endpoint puts
+> your username and password in the query string, and the URL is then handed to
+> Discord. The whole reason this bridge uses `/rest/getAlbumInfo` is that it
+> returns a signed, credential-free URL.
 
 **The status vanishes, flickers, or shows someone else's.** Discord keeps a
 single activity slot and the *last* writer wins, so any other application with
