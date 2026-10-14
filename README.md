@@ -127,6 +127,60 @@ Both real modes also want `NAVIDROME_PUBLIC_URL` — the origin Discord should
 fetch from. The bridge rewrites the cover URLs it is handed to that origin,
 leaving the signed path intact.
 
+#### Serving covers without exposing Navidrome
+
+`COVER_MODE=server` pairs the bridge with a second process, `serve-covers`,
+which serves artwork and nothing else. It is worth running when you want
+covers but would rather not publish Navidrome: putting a login form and an API
+on the internet alongside a JPEG is a bad trade.
+
+It binds loopback only and holds no credentials. The `/share/img/<JWT>` URLs it
+proxies are signed but credential-free, so compromising the process cannot
+reach your account — and it answers `404` to anything that is not a
+well-formed artwork path, before any request is made upstream. `/login`,
+`/rest/…` and path traversal are all refused.
+
+Run it as a second user service:
+
+```ini
+# ~/.config/systemd/user/navidrome-discord-covers.service
+[Unit]
+Description=Navidrome cover art server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/navidrome-discord-rpc/target/release/navidrome-discord-rpc serve-covers
+Environment=COVERS_LISTEN=127.0.0.1:4534
+Environment=NAVIDROME_URL=http://localhost:4533
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Then publish that port through any tunnel or reverse proxy — TLS terminates in
+front of it, and only this process is ever reachable, never Navidrome. With
+[Tailscale Funnel](https://tailscale.com/kb/1223/funnel):
+
+```bash
+tailscale funnel --https=8443 --bg 127.0.0.1:4534
+```
+
+```ini
+Environment=COVER_MODE=server
+Environment=NAVIDROME_PUBLIC_URL=https://<your-node>.<your-tailnet>.ts.net:8443
+```
+
+> **Choose the port deliberately.** Tailscale decides whether a hostname is
+> public or tailnet-only **per port, not per path** — so funnelning a port that
+> an existing `serve` rule already occupies will publish whatever that rule was
+> pointing at, not just the covers. If `tailscale serve status` shows a rule on
+> `:443`, use `8443` or another port and leave `443` alone.
+
+Any reverse proxy works equally well. `serve-covers` only knows how to serve
+images; the bridge only needs an origin Discord can reach.
+
 **The startup line tells you which of three situations you are in**, and they
 are deliberately worded differently:
 
