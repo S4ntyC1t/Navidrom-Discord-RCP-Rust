@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Show the track currently playing on Navidrome as Discord Rich Presence"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/S4ntyC1t/Navidrom-Discord-RCP-Rust"
+repository = "https://github.com/S4ntyC1t/navidrome-discord-rpc"
 
 [dependencies]
 discord-rich-presence = "1.1.0"

@@ -181,6 +181,27 @@ Environment=NAVIDROME_PUBLIC_URL=https://<your-node>.<your-tailnet>.ts.net:8443
 Any reverse proxy works equally well. `serve-covers` only knows how to serve
 images; the bridge only needs an origin Discord can reach.
 
+#### What the published server is bounded to
+
+Once that port is public it is reachable by anyone, so its limits are fixed
+rather than configurable:
+
+| Bound | Value |
+|---|---|
+| Paths served | `/share/img/<token>` only — everything else `404` |
+| Methods | `GET` and `HEAD` — anything else `405` |
+| Concurrent connections | 32, one thread each |
+| Credentials held | none |
+| A single image | 8 MB |
+| Artwork cache | 64 MB across 256 entries |
+| Remembered failures | 1024 paths, one minute each |
+| Request head | 8 KB |
+| Stalled connection | 10 s read timeout |
+
+Non-artwork paths are refused **before** any upstream request, so the endpoint
+cannot be used to browse Navidrome. Only `png`, `jpeg`, `webp` and `gif` are
+republished — `image/*` would include `image/svg+xml`, which carries scripts.
+
 **The startup line tells you which of three situations you are in**, and they
 are deliberately worded differently:
 
@@ -241,9 +262,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now navidrome-discord-rpc.service
 ```
 
-> **Tip:** for anything more than a personal machine, keep the password out of
-> the unit file — put the variables in a `~/.config/navidrome-discord-rpc.env`
-> file (`chmod 600`) and reference it with `EnvironmentFile=` instead.
+> **Tip:** a unit file carrying `Environment=NAVIDROME_PASSWORD=…` is readable
+> by every account on the machine unless you say otherwise — systemd reads units
+> as you, so `chmod 600 ~/.config/systemd/user/navidrome-discord-rpc.service`
+> is safe and costs nothing. For anything more than a personal machine, go
+> further and keep the password out of the unit entirely: put the variables in a
+> `~/.config/navidrome-discord-rpc.env` file (`chmod 600`) and reference it with
+> `EnvironmentFile=` instead.
 
 ## Behaviour
 

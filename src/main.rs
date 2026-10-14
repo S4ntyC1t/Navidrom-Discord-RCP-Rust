@@ -36,6 +36,7 @@ compile_error!(
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -391,17 +392,23 @@ fn subsonic_url(config: &Config, endpoint: &str, extra: &str) -> String {
 fn subsonic_get(client: &Client, config: &Config, endpoint: &str, extra: &str) -> Result<Value, String> {
     let url = subsonic_url(config, endpoint, extra);
 
-    let resp = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("HTTP error: {}", e))?;
+    let resp = client.get(&url).send().map_err(|e| {
+        // `without_url` strips the request URL — query string included — out of
+        // reqwest's message. The query carries the Subsonic token pair, which
+        // is not the password and cannot be reversed into one, but an
+        // access-log habit still has no place in a journal this process cannot
+        // redact from later.
+        format!("HTTP error talking to {}: {}", endpoint, e.without_url())
+    })?;
 
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("Navidrome returned HTTP {}", status));
     }
 
-    let text = resp.text().map_err(|e| format!("HTTP body error: {}", e))?;
+    let text = resp
+        .text()
+        .map_err(|e| format!("HTTP body error: {}", e.without_url()))?;
     let body: Value =
         serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))?;
 
@@ -484,12 +491,18 @@ fn is_locally_only(origin: &str) -> bool {
     let after_scheme = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
     // Drop userinfo, then port — and mind IPv6 brackets (`[::1]:4533`).
     let host = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
+    // Decided before the split below, which eats the very colons that tell an
+    // IPv6 literal (`fd00::1`) from a hostname with a port (`host:4533`).
+    let is_ipv6_literal = host.contains('[') || host.matches(':').count() > 1;
     let host = if let Some(rest) = host.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest)
     } else {
         host.split(':').next().unwrap_or(host)
     };
     let host = host.to_ascii_lowercase();
+    // A fully-qualified `localhost.` names the same host; leaving the dot in
+    // would let it past every check below.
+    let host = host.strip_suffix('.').unwrap_or(&host);
 
     let in_172_private = host
         .strip_prefix("172.")
@@ -497,6 +510,10 @@ fn is_locally_only(origin: &str) -> bool {
         .and_then(|octet| octet.parse::<u8>().ok())
         .is_some_and(|octet| (16..=31).contains(&octet));
 
+    // `fc`/`fd` — the fc00::/7 unique-local range — is only ever applied to
+    // IPv6 literals (see above); as a plain hostname prefix it also swallows
+    // public names like `fcmusic.example.com`, throwing away a cover that
+    // would have worked.
     host.is_empty()
         || host == "localhost"
         || host.ends_with(".localhost")
@@ -509,8 +526,7 @@ fn is_locally_only(origin: &str) -> bool {
         || host.starts_with("192.168.")
         || host.starts_with("169.254.")
         || in_172_private
-        || host.starts_with("fc")
-        || host.starts_with("fd")
+        || (is_ipv6_literal && (host.starts_with("fc") || host.starts_with("fd")))
 }
 
 /// Turns a cover URL Navidrome produced into one Discord can actually fetch.
@@ -721,6 +737,14 @@ mod ipc {
 
     const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+    /// Ceiling on a single reply.
+    ///
+    /// The length prefix is whatever the peer claims, and the body is allocated
+    /// to match. Discord's replies are a few kilobytes at most, so an
+    /// unchecked `u32` would let a hostile or merely confused peer on the other
+    /// end ask this process to allocate four gigabytes.
+    const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
     pub struct Ipc {
         sock: UnixStream,
         nonce: u64,
@@ -803,6 +827,12 @@ mod ipc {
             let mut header = [0u8; 8];
             self.sock.read_exact(&mut header).map_err(|e| map_read_error(e, "header"))?;
             let len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+            if len > MAX_FRAME_BYTES {
+                return Err(format!(
+                    "Discord sent an implausibly large frame ({} bytes)",
+                    len
+                ));
+            }
             let mut body = vec![0u8; len];
             self.sock.read_exact(&mut body).map_err(|e| map_read_error(e, "body"))?;
             let text =
@@ -1064,9 +1094,40 @@ const COVER_MISS_TTL: Duration = Duration::from_secs(60);
 /// not that.
 const COVER_HEAD_MAX: usize = 8 * 1024;
 
-/// Hard ceiling on an upstream image, so a compromised or misbehaving
-/// Navidrome cannot exhaust memory through us.
-const COVER_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Hard ceiling on a single upstream image, so a compromised or misbehaving
+/// Navidrome cannot exhaust memory through us. 8 MB is far beyond any real
+/// album cover — the ones here are ~20 KB.
+const COVER_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Ceiling on the artwork cache as a whole.
+///
+/// The entry count alone is not a memory bound: `COVER_CACHE_MAX` entries at
+/// `COVER_MAX_BYTES` each would be two gigabytes. Evicting on total size makes
+/// the worst case a fixed number rather than a multiplication.
+const COVER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Ceiling on remembered failures.
+///
+/// Without it this map grows without limit: any well-formed token that does not
+/// exist adds an entry, and this server is reachable from the internet.
+const COVER_MISS_MAX: usize = 1024;
+
+/// How many connections may be in flight at once.
+///
+/// The server is publicly reachable, spawns a thread per connection, and each
+/// thread carries a 2 MB stack by default — so an unbounded count is a
+/// memory-exhaustion lever for anyone who finds the port, sharpened by the read
+/// timeout letting each held connection occupy a thread for ten seconds.
+/// Discord fetches a handful of images at a time; this is far above real load
+/// and exists only to bound the worst case.
+const COVER_MAX_CONNECTIONS: usize = 32;
+
+/// Content types we are willing to republish.
+///
+/// `image/*` is broader than it reads: `image/svg+xml` carries scripts, and
+/// serving one from a domain other people trust is a favour nobody asked for.
+/// These are the raster formats Navidrome actually produces for artwork.
+const ALLOWED_COVER_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 struct CoverCacheEntry {
     bytes: Arc<Vec<u8>>,
@@ -1169,11 +1230,9 @@ impl CoverServer {
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
-            .to_ascii_lowercase();
+            .to_string();
 
-        if !content_type.starts_with("image/") {
-            return None;
-        }
+        let media_type = allowed_cover_type(&content_type)?;
 
         let bytes = resp.bytes().ok()?;
         if bytes.is_empty() || bytes.len() > COVER_MAX_BYTES {
@@ -1182,7 +1241,7 @@ impl CoverServer {
 
         Some(CoverCacheEntry {
             bytes: Arc::new(bytes.to_vec()),
-            content_type,
+            content_type: media_type,
         })
     }
 
@@ -1219,10 +1278,17 @@ impl CoverServer {
         }
 
         let Some(entry) = self.fetch(&path) else {
-            self.misses
-                .lock()
-                .expect("miss lock")
-                .insert(path, Instant::now());
+            let mut misses = self.misses.lock().expect("miss lock");
+            // Capped for the same reason the artwork cache is: this map is
+            // keyed by whatever a client chose to ask for, so without a bound
+            // anyone probing the public endpoint grows it without limit.
+            while misses.len() >= COVER_MISS_MAX {
+                let Some(oldest) = misses.keys().next().cloned() else {
+                    break;
+                };
+                misses.remove(&oldest);
+            }
+            misses.insert(path, Instant::now());
             return error_response(404, "not found", None, wants_head);
         };
 
@@ -1235,7 +1301,8 @@ impl CoverServer {
             let mut hits = self.hits.lock().expect("cache lock");
             // Evict arbitrarily rather than implementing an LRU: refetching a
             // cover is a local request, and predictability beats cleverness in
-            // a component that faces the internet.
+            // a component that faces the internet. Both bounds are needed —
+            // the entry count for bookkeeping, the total size for memory.
             while hits.len() >= COVER_CACHE_MAX {
                 let Some(oldest) = hits.keys().next().cloned() else {
                     break;
@@ -1243,11 +1310,43 @@ impl CoverServer {
                 hits.remove(&oldest);
             }
             hits.insert(path, entry);
+            while !hits.is_empty() && total_cached_bytes(&hits) > COVER_CACHE_BYTES {
+                let Some(oldest) = hits.keys().next().cloned() else {
+                    break;
+                };
+                hits.remove(&oldest);
+            }
         }
-        self.misses.lock().expect("miss lock").clear();
 
         response
     }
+}
+
+/// Total bytes held by the artwork cache — the bound that actually matters for
+/// memory, since entry count on its own multiplies with whatever a single image
+/// is allowed to weigh.
+fn total_cached_bytes(hits: &HashMap<String, CoverCacheEntry>) -> usize {
+    hits.values().map(|entry| entry.bytes.len()).sum()
+}
+
+/// Normalises a `Content-Type` header to a media type we are willing to
+/// republish, or `None` when it is not one.
+///
+/// Parameters are not part of the media type — and only the media type is
+/// allowlisted, because `image/*` is broader than it reads: `image/svg+xml`
+/// carries scripts, and serving one from a domain other people trust is a
+/// favour nobody asked for.
+fn allowed_cover_type(header: &str) -> Option<String> {
+    let media_type = header
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    ALLOWED_COVER_TYPES
+        .contains(&media_type.as_str())
+        .then_some(media_type)
 }
 
 fn image_response(entry: &CoverCacheEntry, head_only: bool) -> Vec<u8> {
@@ -1360,6 +1459,7 @@ fn serve_covers() -> ! {
     };
 
     let server = Arc::new(CoverServer::new(upstream.clone()));
+    let active = Arc::new(AtomicUsize::new(0));
 
     println!("Cover server starting (album art only, no credentials held)");
     println!("  Listening on: {}", listen);
@@ -1368,14 +1468,41 @@ fn serve_covers() -> ! {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let server = Arc::clone(&server);
+        let active = Arc::clone(&active);
+
+        if active.fetch_add(1, Ordering::Relaxed) >= COVER_MAX_CONNECTIONS {
+            // At the cap: drop the connection rather than queue it. A queue
+            // would hold the caller's connection open — which is the very
+            // resource being spent — and just as effectively.
+            active.fetch_sub(1, Ordering::Relaxed);
+            continue;
+        }
+
+        let slot = ConnectionSlot(Arc::clone(&active));
         // A thread per connection: an upstream fetch can take as long as the
         // HTTP timeout, and one slow image must not stall the rest.
-        thread::spawn(move || handle_connection(&server, stream));
+        thread::spawn(move || {
+            handle_connection(&server, stream);
+            drop(slot);
+        });
     }
 
     // `incoming` only ends if the listener itself fails.
     eprintln!("Cover server listener stopped unexpectedly");
     std::process::exit(1);
+}
+
+/// Releases one of the bounded connection slots when dropped.
+///
+/// A `Drop` rather than a decrement at the end of the handler, so that a panic
+/// in a handler thread cannot leak a slot and quietly close the server to
+/// legitimate traffic over time.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn main() {
@@ -2238,6 +2365,141 @@ mod tests {
                 target,
                 &response[..15.min(response.len())]
             );
+        }
+    }
+
+    // ---- Cover server limits -------------------------------------------
+
+    #[test]
+    fn only_raster_images_are_republished() {
+        // `image/*` is broader than it reads: `image/svg+xml` carries scripts,
+        // and this server is reachable from the internet.
+        for header in [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            // Parameters are not part of the media type.
+            "image/png; charset=binary",
+            "IMAGE/PNG",
+        ] {
+            assert!(
+                allowed_cover_type(header).is_some(),
+                "should have been accepted: {header}"
+            );
+        }
+
+        for header in [
+            "image/svg+xml",
+            "image/svg+xml; charset=utf-8",
+            "text/html",
+            "application/json",
+            "image/png/svg+xml",
+            "",
+        ] {
+            assert_eq!(
+                allowed_cover_type(header),
+                None,
+                "should have been refused: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cache_reports_the_bytes_it_holds() {
+        // Entry count alone is not a memory bound: the whole reason the cache
+        // is evicted on total size as well.
+        let mut hits = HashMap::new();
+        assert_eq!(total_cached_bytes(&hits), 0);
+
+        hits.insert(
+            "a".to_string(),
+            CoverCacheEntry {
+                bytes: Arc::new(vec![0u8; 300]),
+                content_type: "image/png".into(),
+            },
+        );
+        hits.insert(
+            "b".to_string(),
+            CoverCacheEntry {
+                bytes: Arc::new(vec![0u8; 700]),
+                content_type: "image/jpeg".into(),
+            },
+        );
+        assert_eq!(total_cached_bytes(&hits), 1000);
+    }
+
+    #[test]
+    fn a_dropped_connection_slot_frees_its_place() {
+        // This counter is what bounds concurrent connections. A handler that
+        // panics must still hand its slot back, or the server closes itself to
+        // legitimate traffic one panic at a time — which is exactly what the
+        // `Drop` impl exists for.
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        counter.fetch_add(1, Ordering::Relaxed);
+        {
+            let _slot = ConnectionSlot(Arc::clone(&counter));
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        let panicking = Arc::clone(&counter);
+        let handle = std::thread::spawn(move || {
+            panicking.fetch_add(1, Ordering::Relaxed);
+            let _slot = ConnectionSlot(Arc::clone(&panicking));
+            panic!("handler panicked");
+        });
+        assert!(handle.join().is_err());
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "a panicking handler leaked its connection slot"
+        );
+    }
+
+    // ---- Host reachability ---------------------------------------------
+
+    #[test]
+    fn a_public_hostname_is_never_dropped_for_looking_like_ipv6() {
+        // `fc00::/7` is unique-local, but only ever as an IPv6 literal. Read
+        // as a plain hostname prefix it also matches public names, and a cover
+        // dropped here is one that would have rendered.
+        for origin in [
+            "https://fcmusic.example.com",
+            "https://fdmusic.example.com",
+            "https://fc2.example.org",
+            "fcmusic.example.com",
+        ] {
+            assert!(!is_locally_only(origin), "treated as local: {origin}");
+        }
+    }
+
+    #[test]
+    fn an_ipv6_unique_local_address_is_still_local() {
+        // The complement of the test above: the check must not have loosened
+        // into never firing.
+        for origin in [
+            "http://[fd00::1]:4533",
+            "http://[fc00::1]",
+            "fd00::1",
+            "[fd12:3456::1]:4533",
+        ] {
+            assert!(is_locally_only(origin), "treated as public: {origin}");
+        }
+    }
+
+    #[test]
+    fn a_fully_qualified_localhost_is_local() {
+        // `localhost.` names the same host as `localhost`; the trailing dot
+        // used to slip past every check and go to Discord unresolvable.
+        for origin in [
+            "localhost.",
+            "http://localhost.:4533",
+            "LOCALHOST.",
+            "http://127.0.0.1.:4533",
+        ] {
+            assert!(is_locally_only(origin), "treated as public: {origin}");
         }
     }
 }
