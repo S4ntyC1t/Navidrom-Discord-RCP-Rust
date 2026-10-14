@@ -2066,7 +2066,10 @@ mod tests {
     fn auth_config(password: &str) -> Config {
         Config {
             base_url: "http://localhost:4533".into(),
-            username: "S4ntyC1t".into(),
+            // A placeholder, deliberately: these tests only ever assert on what
+            // a real account name would look like once encoded into a URL, and
+            // a public repository is no place for anybody's actual one.
+            username: "demo_user".into(),
             password: password.into(),
             // These tests build URLs; cover mode plays no part in that, so the
             // field carries the default rather than a value that would look
@@ -2092,7 +2095,7 @@ mod tests {
                 !url.contains("?p=") && !url.contains("&p="),
                 "plaintext password param: {url}"
             );
-            assert!(url.contains("u=S4ntyC1t"), "username missing: {url}");
+            assert!(url.contains("u=demo_user"), "username missing: {url}");
             assert!(url.contains("&t="), "token missing: {url}");
             assert!(url.contains("&s="), "salt missing: {url}");
         }
