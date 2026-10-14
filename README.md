@@ -86,7 +86,8 @@ All configuration is via environment variables.
 | `NAVIDROME_USER`       | yes      | —                       | Navidrome username                                     |
 | `NAVIDROME_PASSWORD`   | yes      | —                       | Navidrome password                                     |
 | `NAVIDROME_URL`        | no       | `http://localhost:4533` | Navidrome base URL                                     |
-| `NAVIDROME_PUBLIC_URL` | no       | —                       | Public origin of Navidrome — required for cover art    |
+| `NAVIDROME_PUBLIC_URL` | no       | —                       | Public origin serving the artwork — required for covers |
+| `COVER_MODE`           | no       | `off`                   | Where cover art comes from: `off`, `navidrome`, `server` |
 | `DISCORD_CLIENT_ID`    | no       | built-in application    | Discord Application ID to show as                      |
 | `POLL_INTERVAL`        | no       | `1`                     | Poll interval, in seconds                              |
 
@@ -102,17 +103,49 @@ the token is derived from, held in memory and nowhere else.
 
 ### Cover art
 
-Discord downloads presence images **from its own servers**, so it cannot reach
-your `localhost`. Set `NAVIDROME_PUBLIC_URL` to the origin Navidrome is
-reachable at from the internet, and the bridge rewrites the cover URLs it is
-handed to that origin:
+Cover art is **opt-in**, and the reason is structural: Discord downloads
+presence images **from its own servers**, so it cannot reach your `localhost`.
+Some public endpoint is therefore unavoidable — and most setups do not have
+one. Rather than pretend otherwise, the bridge ships with covers off and says
+so once at startup.
+
+`COVER_MODE` names where the images come from:
+
+| Mode | Images served by | Needs |
+|------|------------------|-------|
+| `off` *(default)* | nobody — plain status | nothing at all |
+| `navidrome` | Navidrome itself | Navidrome reachable from the internet |
+| `server` | the bundled `serve-covers` process | that process, behind a tunnel or reverse proxy |
 
 ```ini
+# Navidrome is already exposed (many people do this for the mobile app):
+Environment=COVER_MODE=navidrome
 Environment=NAVIDROME_PUBLIC_URL=https://music.example.com
 ```
 
-Leave it unset and cover art stays off — the bridge will say so at startup
-rather than silently sending an image nobody can load.
+Both real modes also want `NAVIDROME_PUBLIC_URL` — the origin Discord should
+fetch from. The bridge rewrites the cover URLs it is handed to that origin,
+leaving the signed path intact.
+
+**The startup line tells you which of three situations you are in**, and they
+are deliberately worded differently:
+
+```
+Cover art: off — set COVER_MODE=navidrome (or server) …     # nothing configured yet
+Cover art: from Navidrome at https://…                      # configured and workable
+Warning: COVER_MODE=server but NAVIDROME_PUBLIC_URL …       # asked for, will not appear
+```
+
+The first is a hint, not a failure — a first run with no public endpoint has
+nothing wrong with it. The last two are the only things worth acting on: a
+mode selected without an origin, or an origin set while the mode is still
+`off`. An unknown `COVER_MODE` is rejected outright at startup with exit code
+`2` rather than falling back to `off`, because a typo that silently disables
+the feature is exactly what the variable exists to prevent.
+
+`server` mode never falls back to Navidrome's own URLs. That mode exists
+*because* Navidrome is private, so handing Discord an address already known to
+be unreachable would just produce a blank square with no explanation.
 
 > **Keep the credentials out of those URLs.** Navidrome's cover endpoints
 > (`/rest/getCoverArt`) put the username and password into the query string,
@@ -136,7 +169,8 @@ ExecStart=%h/navidrome-discord-rpc/target/release/navidrome-discord-rpc
 Environment=NAVIDROME_URL=http://localhost:4533
 Environment=NAVIDROME_USER=your_user
 Environment=NAVIDROME_PASSWORD=your_password
-# Optional: cover art, once Navidrome is reachable from the internet.
+# Optional: cover art. Pick a mode, then the origin Discord should fetch from.
+# Environment=COVER_MODE=navidrome
 # Environment=NAVIDROME_PUBLIC_URL=https://music.example.com
 # Optional: only if you use your own Discord application.
 # Environment=DISCORD_CLIENT_ID=123456789012345678
@@ -203,21 +237,33 @@ are [only rendered to *other* users](https://docs.discord.com/developers/discord
 — the account that set the activity never sees them on itself. To check they
 work, look at your profile from a second account, or ask a friend.
 
-**No album art.** Three things must line up, and the startup log tells you
-which is missing:
+**No album art.** Four things must line up, and the startup log says which is
+missing:
 
-1. `NAVIDROME_PUBLIC_URL` must be set to an origin Discord can reach from the
-   internet. Without it the bridge logs
-   `Cover art: only if Navidrome is publicly reachable` and sends no image —
-   deliberately, since a `localhost` URL would just fail to load.
-2. It must be **https**. Discord may refuse a plain `http://` image, and the
+1. `COVER_MODE` must be `navidrome` or `server`. It defaults to `off`, and the
+   bridge prints `Cover art: off — set COVER_MODE=…` when nothing has been
+   chosen.
+2. `NAVIDROME_PUBLIC_URL` must be an origin Discord can reach from the
+   internet. Missing it produces a `Warning:` at startup and no image —
+   deliberately, since a `localhost` URL would just fail to load. If Navidrome
+   already has a public `BaseUrl`, `navidrome` mode can work without it.
+3. It must be **https**. Discord may refuse a plain `http://` image, and the
    symptom is a silently missing cover.
-3. The album must have artwork at all. Navidrome reports this as an empty
+4. The album must have artwork at all. Navidrome reports this as an empty
    `albumInfo`, and the bridge skips it rather than sending a broken frame.
 
-If art is configured but a track reports
-`Cover art lookup failed …`, the request itself is failing — check that
-`NAVIDROME_URL` is right and the account may read the album.
+In `server` mode also confirm the cover server is up and actually published —
+it must be reachable from the internet through whatever tunnel or reverse proxy
+you put in front of it:
+
+```bash
+systemctl --user status navidrome-discord-covers
+curl -I https://your-tunnel-origin/share/img/<token>
+```
+
+If art is configured but a track reports `Cover art lookup failed …`, the
+request itself is failing — check that `NAVIDROME_URL` is right and the account
+may read the album.
 
 > **Do not "fix" this by pointing at `/rest/getCoverArt`.** That endpoint puts
 > your username and password in the query string, and the URL is then handed to

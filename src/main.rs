@@ -11,8 +11,15 @@
 //! | `NAVIDROME_PASSWORD`   | yes      | —                       |
 //! | `NAVIDROME_URL`        | no       | `http://localhost:4533` |
 //! | `NAVIDROME_PUBLIC_URL` | no       | — (no cover art)        |
+//! | `COVER_MODE`           | no       | `off`                   |
 //! | `DISCORD_CLIENT_ID`    | no       | built-in application    |
 //! | `POLL_INTERVAL`        | no       | `1` (second)            |
+//!
+//! Cover art is opt-in: `COVER_MODE` names where the images come from
+//! (`navidrome` — Navidrome itself; `server` — the bundled `serve-covers`
+//! process), and both need `NAVIDROME_PUBLIC_URL` to be something Discord can
+//! reach. With no mode selected there are no covers, and the bridge says so
+//! once at startup rather than leaving a blank square to be puzzling over.
 //!
 //! Authentication uses the Subsonic token scheme (`t`/`s`), never `p=`: the
 //! password never leaves this process, so it can never end up in a URL, in the
@@ -26,13 +33,18 @@ compile_error!(
      yet. See the Platform section of README.md."
 );
 
-use std::io::Read;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use discord_rich_presence::activity::{
     Activity, ActivityType, Assets, Button, StatusDisplayType, Timestamps,
 };
 use reqwest::blocking::Client;
+use reqwest::header::CONTENT_TYPE;
 use serde_json::Value;
 
 /// Discord Application ID bundled with the project. It is a public identifier
@@ -58,17 +70,129 @@ Required environment variables:
 
 Optional:
   NAVIDROME_URL        Navidrome base URL       (default http://localhost:4533)
-  NAVIDROME_PUBLIC_URL Public origin of Navidrome, e.g. https://music.example.com.
-                       Required for cover art: Discord fetches images from its
-                       own servers, so a localhost URL is unreachable for it.
+  NAVIDROME_PUBLIC_URL Public origin serving the artwork, e.g.
+                       https://music.example.com. Required for cover art:
+                       Discord fetches images from its own servers, so a
+                       localhost URL is unreachable for it.
+  COVER_MODE           Where cover art comes from (default off):
+                         off       no cover art at all
+                         navidrome Navidrome serves it — must be public
+                         server    `serve-covers` serves it behind a tunnel
   DISCORD_CLIENT_ID    Override the built-in Discord Application ID
-  POLL_INTERVAL        Poll interval in seconds (default 1)";
+  POLL_INTERVAL        Poll interval in seconds (default 1)
+
+Cover server (`navidrome-discord-rpc serve-covers`) reads only:
+  NAVIDROME_URL        Navidrome base URL       (default http://localhost:4533)
+  COVERS_LISTEN        Address to bind          (default 127.0.0.1:4534)
+  It needs no credentials: the image URLs it serves are signed and
+  credential-free by design.";
+
+/// Where cover art comes from.
+///
+/// Selected explicitly rather than inferred, so that "no covers" is a setting
+/// the operator made instead of a feature that quietly failed. The default
+/// needs no infrastructure whatsoever, which is the honest common case: Discord
+/// downloads presence images from its own servers, so *some* public endpoint
+/// is unavoidable — and most people have not set one up yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverMode {
+    /// No cover art. The default, and a fully supported way to run.
+    Off,
+    /// Navidrome serves the artwork itself — workable only when Navidrome is
+    /// publicly reachable, whether through its own `BaseUrl` or through an
+    /// explicit `NAVIDROME_PUBLIC_URL`.
+    Navidrome,
+    /// The bundled `serve-covers` process serves the artwork behind a tunnel
+    /// or reverse proxy. This mode exists precisely because Navidrome is *not*
+    /// public, so its own URLs are never used as a fallback.
+    Server,
+}
+
+impl CoverMode {
+    /// Parses `COVER_MODE`. Anything unrecognised is an error rather than a
+    /// silent fall-back to `off` — a typo that disables a feature you asked
+    /// for is exactly the failure this variable is here to prevent.
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "off" => Ok(Self::Off),
+            "navidrome" => Ok(Self::Navidrome),
+            "server" => Ok(Self::Server),
+            other => Err(format!(
+                "COVER_MODE must be one of: off, navidrome, server — got: {}",
+                other
+            )),
+        }
+    }
+}
+
+/// Whether a startup line is passing remark or something the operator must act
+/// on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverStatus {
+    /// Nothing is wrong; this is just where things stand.
+    Info,
+    /// Covers were asked for in a way that will not produce any.
+    Warning,
+}
+
+/// The one line printed at startup about cover art.
+///
+/// It deliberately separates two situations that look identical to a newcomer
+/// if phrased carelessly: "you have not set covers up, and here is how" must
+/// not read as a failure on first run, while "you did set covers up, and they
+/// will not appear" must. Conflating them is how an optional feature ends up
+/// silently broken for months.
+fn cover_status(mode: CoverMode, public_url: Option<&str>) -> (CoverStatus, String) {
+    match (mode, public_url) {
+        (CoverMode::Off, None) => (
+            CoverStatus::Info,
+            "Cover art: off — set COVER_MODE=navidrome (or server) and a public \
+             NAVIDROME_PUBLIC_URL to enable it"
+                .to_string(),
+        ),
+        // The operator reached for the origin without turning the feature on:
+        // they clearly meant to have covers, so say plainly why there are none.
+        (CoverMode::Off, Some(_)) => (
+            CoverStatus::Warning,
+            "Warning: NAVIDROME_PUBLIC_URL is set but COVER_MODE is off, so no \
+             covers will be shown — add COVER_MODE=navidrome or COVER_MODE=server"
+                .to_string(),
+        ),
+        (CoverMode::Navidrome, Some(public)) => (
+            CoverStatus::Info,
+            format!("Cover art: from Navidrome at {}", public),
+        ),
+        // Not a warning: a Navidrome with a `BaseUrl` configured already hands
+        // back reachable URLs, so covers genuinely may work here.
+        (CoverMode::Navidrome, None) => (
+            CoverStatus::Info,
+            "Cover art: from Navidrome itself — shown only if Navidrome is \
+             publicly reachable (set NAVIDROME_PUBLIC_URL to pin the origin)"
+                .to_string(),
+        ),
+        (CoverMode::Server, Some(public)) => (
+            CoverStatus::Info,
+            format!("Cover art: from the cover server at {}", public),
+        ),
+        // Unambiguously broken: `server` mode exists because Navidrome is not
+        // exposed, so there is no fall-back URL that could possibly work.
+        (CoverMode::Server, None) => (
+            CoverStatus::Warning,
+            "Warning: COVER_MODE=server but NAVIDROME_PUBLIC_URL is not set — \
+             covers will not appear. Point it at the origin your tunnel or \
+             reverse proxy publishes the cover server on"
+                .to_string(),
+        ),
+    }
+}
 
 /// Everything the bridge needs to run, read once at startup.
 struct Config {
     base_url: String,
     username: String,
     password: String,
+    /// Where cover art comes from; `Off` unless the operator says otherwise.
+    cover_mode: CoverMode,
     /// Public origin Navidrome is reachable at, if the operator set one.
     ///
     /// Discord downloads presence images from its own servers, so a URL on
@@ -125,6 +249,8 @@ impl Config {
             base_url,
             username: required("NAVIDROME_USER")?,
             password: required("NAVIDROME_PASSWORD")?,
+            // A bad value is a hard error (see `CoverMode::parse`).
+            cover_mode: CoverMode::parse(&std::env::var("COVER_MODE").unwrap_or_default())?,
             public_url,
             client_id: std::env::var("DISCORD_CLIENT_ID")
                 .ok()
@@ -395,11 +521,21 @@ fn is_locally_only(origin: &str) -> bool {
 /// operator declared `NAVIDROME_PUBLIC_URL` we swap that origin in; otherwise
 /// we keep the URL only when Navidrome already returned a publicly reachable
 /// one (it will have a `BaseUrl` configured), and drop it silently when not.
-fn public_image_url(raw: &str, public_url: Option<&str>) -> Option<String> {
+///
+/// `CoverMode::Server` is the exception: in that mode Navidrome is private by
+/// construction — publishing it would defeat the point of running a separate
+/// cover server — so its own URL is never offered as a fallback. Handing
+/// Discord an address we already know is unreachable would just produce a
+/// missing image with no explanation, which is worse than no image at all.
+fn public_image_url(raw: &str, public_url: Option<&str>, mode: CoverMode) -> Option<String> {
     let (origin, rest) = split_origin(raw)?;
 
     if let Some(public) = public_url {
         return Some(format!("{}{}", public, rest));
+    }
+
+    if mode == CoverMode::Server {
+        return None;
     }
 
     if is_locally_only(origin) {
@@ -421,7 +557,11 @@ fn public_image_url(raw: &str, public_url: Option<&str>) -> Option<String> {
 /// but **credential-free** — no username, no password, no token — which is
 /// exactly what may be handed to a third party like Discord.
 fn fetch_cover(client: &Client, config: &Config, track_id: &str) -> Result<Option<String>, String> {
-    if track_id.is_empty() {
+    // Covers off means the request is never made: the mode is the switch, so
+    // an operator who configured no public endpoint pays nothing per track
+    // instead of a wasted `getAlbumInfo` round-trip every time the song
+    // changes.
+    if config.cover_mode == CoverMode::Off || track_id.is_empty() {
         return Ok(None);
     }
 
@@ -445,7 +585,7 @@ fn fetch_cover(client: &Client, config: &Config, track_id: &str) -> Result<Optio
         return Ok(None);
     };
 
-    Ok(public_image_url(raw, config.public_url.as_deref()))
+    Ok(public_image_url(raw, config.public_url.as_deref(), config.cover_mode))
 }
 
 /// The presence fields we compute for a track, kept separate from the Discord
@@ -877,7 +1017,8 @@ fn print_usage() {
          Shows the track playing on Navidrome as Discord Rich Presence.\n\
          \n\
          Usage:\n\
-         \x20 navidrome-discord-rpc\n\
+         \x20 navidrome-discord-rpc            Start the bridge (needs the variables below)\n\
+         \x20 navidrome-discord-rpc serve-covers  Run the album-art server instead\n\
          \n\
          {}\n\
          \n\
@@ -889,6 +1030,354 @@ fn print_usage() {
     );
 }
 
+// ---- Cover server -------------------------------------------------------
+//
+// A deliberately narrow HTTP server: it hands out album artwork and nothing
+// else. It exists because Discord fetches presence images from its own
+// servers, and opening Navidrome to the internet just to serve a JPEG would
+// publish a login form and an API alongside it. So this listens on loopback
+// only and is published through Tailscale Funnel, which terminates TLS in
+// front of it and is the sole thing that ever talks to it.
+//
+// It holds no credentials on purpose. The `/share/img/<JWT>` URLs it proxies
+// are signed but carry no username or password — Navidrome serves them without
+// authentication — so a compromise of this process cannot reach the account,
+// cannot list the library, and cannot reach any Navidrome endpoint other than
+// the single image path it is willing to construct.
+
+/// Loopback by default. The only intended client is the Funnel relay running
+/// on this machine; binding wider would publish a server nobody asked for to
+/// the local network.
+const DEFAULT_COVERS_LISTEN: &str = "127.0.0.1:4534";
+
+/// Upper bound on cached artwork. Covers are tens of KB each, so this tops out
+/// at a few megabytes — the cap exists to bound memory against a client that
+/// walks every token it can guess, not because the images are large.
+const COVER_CACHE_MAX: usize = 256;
+
+/// How long a failed lookup is remembered. Without this, a flood of invented
+/// paths would turn the server into a load generator pointed at Navidrome.
+const COVER_MISS_TTL: Duration = Duration::from_secs(60);
+
+/// Cap on how much of a request we are willing to read. A browser or Discord
+/// fetching a picture sends a few hundred bytes; anything approaching this is
+/// not that.
+const COVER_HEAD_MAX: usize = 8 * 1024;
+
+/// Hard ceiling on an upstream image, so a compromised or misbehaving
+/// Navidrome cannot exhaust memory through us.
+const COVER_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+struct CoverCacheEntry {
+    bytes: Arc<Vec<u8>>,
+    content_type: String,
+}
+
+struct CoverServer {
+    /// Navidrome origin, without a trailing slash.
+    upstream: String,
+    client: Client,
+    hits: Mutex<HashMap<String, CoverCacheEntry>>,
+    /// Path -> when it last failed.
+    misses: Mutex<HashMap<String, Instant>>,
+}
+
+/// Validates a request target down to exactly the upstream path we are willing
+/// to fetch.
+///
+/// Returns `None` for anything that is not a well-formed artwork request. This
+/// is the whole security boundary of the server: it is what keeps a request
+/// from steering the upstream fetch onto another Navidrome endpoint, out of
+/// the share directory, or into a header through an injected newline.
+fn cover_upstream_path(target: &str) -> Option<String> {
+    // Only origin-form targets. An absolute-form target ("GET http://host/…")
+    // would name an origin we did not choose, so refuse it outright.
+    if target.contains("://") || target.contains('#') || target.contains(' ') {
+        return None;
+    }
+
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    };
+
+    // Two accepted prefixes, because it is not obvious whether the Funnel
+    // handler forwards the mounted path or strips it — accepting both costs
+    // nothing and removes a whole class of "works locally, 404s in prod".
+    let token = path
+        .strip_prefix("/share/img/")
+        .or_else(|| path.strip_prefix("/img/"))?;
+
+    // Navidrome's token is base64url segments joined by dots. Anything outside
+    // that alphabet — a slash, a dot-dot, a percent escape, a newline — is not
+    // a token we could have handed out.
+    let token_ok = !token.is_empty()
+        && !token.contains("..")
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !token_ok {
+        return None;
+    }
+
+    let query = match query {
+        None | Some("") => String::new(),
+        Some(q) => {
+            // Bounded in both length and charset: enough for the `size=600`
+            // Navidrome actually emits, while excluding anything that could
+            // inject a header, escape into another path, or name another
+            // origin. Extra well-formed parameters are forwarded and ignored
+            // upstream — the path is already pinned to the share endpoint.
+            let query_ok = q.len() <= 64
+                && q
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '=' | '&' | '.' | '-'));
+            if !query_ok {
+                return None;
+            }
+            format!("?{}", q)
+        }
+    };
+
+    Some(format!("/share/img/{}{}", token, query))
+}
+
+impl CoverServer {
+    fn new(upstream: String) -> Self {
+        Self {
+            upstream,
+            client: Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            hits: Mutex::new(HashMap::new()),
+            misses: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Fetches from Navidrome and keeps only something that is actually an
+    /// image. An error page served with a 200 would otherwise be published to
+    /// the internet as if it were artwork.
+    fn fetch(&self, path: &str) -> Option<CoverCacheEntry> {
+        let resp = self.client.get(format!("{}{}", self.upstream, path)).send().ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_ascii_lowercase();
+
+        if !content_type.starts_with("image/") {
+            return None;
+        }
+
+        let bytes = resp.bytes().ok()?;
+        if bytes.is_empty() || bytes.len() > COVER_MAX_BYTES {
+            return None;
+        }
+
+        Some(CoverCacheEntry {
+            bytes: Arc::new(bytes.to_vec()),
+            content_type,
+        })
+    }
+
+    fn respond(&self, method: &str, target: &str) -> Vec<u8> {
+        if method != "GET" && method != "HEAD" {
+            return error_response(
+                405,
+                "method not allowed",
+                Some("Allow: GET, HEAD\r\n"),
+                method == "HEAD",
+            );
+        }
+        let wants_head = method == "HEAD";
+
+        // Unparseable paths never reach Navidrome: answering here is both
+        // faster and what stops the server being used to poke at upstream.
+        let Some(path) = cover_upstream_path(target) else {
+            return error_response(404, "not found", None, wants_head);
+        };
+
+        if let Some(entry) = self.hits.lock().expect("cache lock").get(&path) {
+            return image_response(entry, wants_head);
+        }
+
+        // Recently failed: answer without asking Navidrome again.
+        let recently_missed = self
+            .misses
+            .lock()
+            .expect("miss lock")
+            .get(&path)
+            .is_some_and(|at| at.elapsed() < COVER_MISS_TTL);
+        if recently_missed {
+            return error_response(404, "not found", None, wants_head);
+        }
+
+        let Some(entry) = self.fetch(&path) else {
+            self.misses
+                .lock()
+                .expect("miss lock")
+                .insert(path, Instant::now());
+            return error_response(404, "not found", None, wants_head);
+        };
+
+        // Built before the entry is moved into the cache. Reading it back out
+        // afterwards would mean picking an arbitrary value from a HashMap —
+        // which is how one listener ends up serving another track's cover.
+        let response = image_response(&entry, wants_head);
+
+        {
+            let mut hits = self.hits.lock().expect("cache lock");
+            // Evict arbitrarily rather than implementing an LRU: refetching a
+            // cover is a local request, and predictability beats cleverness in
+            // a component that faces the internet.
+            while hits.len() >= COVER_CACHE_MAX {
+                let Some(oldest) = hits.keys().next().cloned() else {
+                    break;
+                };
+                hits.remove(&oldest);
+            }
+            hits.insert(path, entry);
+        }
+        self.misses.lock().expect("miss lock").clear();
+
+        response
+    }
+}
+
+fn image_response(entry: &CoverCacheEntry, head_only: bool) -> Vec<u8> {
+    let mut out = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+         Cache-Control: public, max-age=86400\r\nX-Content-Type-Options: nosniff\r\n\
+         Connection: close\r\n\r\n",
+        entry.content_type,
+        entry.bytes.len()
+    )
+    .into_bytes();
+
+    if !head_only {
+        out.extend_from_slice(&entry.bytes);
+    }
+    out
+}
+
+fn error_response(status: u16, reason: &str, extra: Option<&str>, head_only: bool) -> Vec<u8> {
+    let body = format!("{} {}\n", status, reason);
+    let mut out = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nConnection: close\r\n{}\r\n",
+        status,
+        reason,
+        if head_only { 0 } else { body.len() },
+        extra.unwrap_or("")
+    )
+    .into_bytes();
+
+    if !head_only {
+        out.extend_from_slice(body.as_bytes());
+    }
+    out
+}
+
+/// Reads up to the end of the request head. Bounded, and gives up rather than
+/// accumulating whatever a client keeps sending.
+fn read_head(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+
+    while buf.len() < COVER_HEAD_MAX {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..read]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() >= COVER_HEAD_MAX {
+            break;
+        }
+    }
+
+    if buf.is_empty() {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+fn handle_connection(server: &CoverServer, mut stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(HTTP_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HTTP_TIMEOUT));
+
+    let Some(head) = read_head(&mut stream) else {
+        return;
+    };
+
+    // Only the request line matters: everything else in the head is ignored,
+    // so nothing a client sends can influence what is served.
+    let Some(request_line) = head.lines().next() else {
+        let _ = stream.write_all(&error_response(400, "bad request", None, false));
+        return;
+    };
+
+    let mut parts = request_line.split_whitespace();
+    let (method, target) = match (parts.next(), parts.next()) {
+        (Some(m), Some(t)) => (m.to_string(), t.to_string()),
+        _ => {
+            let _ = stream.write_all(&error_response(400, "bad request", None, false));
+            return;
+        }
+    };
+
+    let response = server.respond(&method, &target);
+    let _ = stream.write_all(&response);
+    let _ = stream.flush();
+}
+
+/// Runs the cover server. Does not return.
+fn serve_covers() -> ! {
+    // Deliberately reads no credentials: see the note atop this section.
+    let upstream = std::env::var("NAVIDROME_URL")
+        .unwrap_or_else(|_| "http://localhost:4533".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let listen = std::env::var("COVERS_LISTEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_COVERS_LISTEN.to_string());
+
+    let listener = match TcpListener::bind(&listen) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Cover server failed to bind {}: {}", listen, e);
+            std::process::exit(2);
+        }
+    };
+
+    let server = Arc::new(CoverServer::new(upstream.clone()));
+
+    println!("Cover server starting (album art only, no credentials held)");
+    println!("  Listening on: {}", listen);
+    println!("  Upstream:     {}/share/img/<token>", upstream);
+
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let server = Arc::clone(&server);
+        // A thread per connection: an upstream fetch can take as long as the
+        // HTTP timeout, and one slow image must not stall the rest.
+        thread::spawn(move || handle_connection(&server, stream));
+    }
+
+    // `incoming` only ends if the listener itself fails.
+    eprintln!("Cover server listener stopped unexpectedly");
+    std::process::exit(1);
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("-h" | "--help") => {
@@ -898,6 +1387,9 @@ fn main() {
         Some("-V" | "--version") => {
             println!("navidrome-discord-rpc {}", env!("CARGO_PKG_VERSION"));
             return;
+        }
+        Some("serve-covers") => {
+            serve_covers();
         }
         Some(other) => {
             eprintln!("Unknown argument: {}\n", other);
@@ -929,14 +1421,14 @@ fn main() {
     println!("  User: {}", config.username);
     println!("  Poll interval: {}s", config.poll_interval);
     println!("  Discord client_id: {}", config.client_id);
-    match &config.public_url {
-        // Being honest here: without this, covers silently never appear, which
-        // looks exactly like a broken feature.
-        Some(public) => println!("  Cover art: through {}", public),
-        None => println!(
-            "  Cover art: only if Navidrome is publicly reachable \
-             (set NAVIDROME_PUBLIC_URL to enable it from a local server)"
-        ),
+    // Being honest here: without this, covers silently never appear, which
+    // looks exactly like a broken feature. A first run with nothing configured
+    // gets a hint; a run where covers were requested but cannot work gets a
+    // warning.
+    let (severity, cover_line) = cover_status(config.cover_mode, config.public_url.as_deref());
+    match severity {
+        CoverStatus::Info => println!("  {}", cover_line),
+        CoverStatus::Warning => eprintln!("  {}", cover_line),
     }
 
     let mut rpc = Rpc::new(config.client_id.clone());
@@ -1384,6 +1876,10 @@ mod tests {
             base_url: "http://localhost:4533".into(),
             username: "S4ntyC1t".into(),
             password: password.into(),
+            // These tests build URLs; cover mode plays no part in that, so the
+            // field carries the default rather than a value that would look
+            // meaningful if read in isolation.
+            cover_mode: CoverMode::Off,
             public_url: None,
             client_id: DEFAULT_DISCORD_CLIENT_ID.into(),
             poll_interval: 1,
@@ -1453,7 +1949,8 @@ mod tests {
         // intact, since the JWT inside it is what authorises the fetch.
         let raw = "http://localhost:4533/share/img/eyJhbGciOiJ9.sig?size=600";
         assert_eq!(
-            public_image_url(raw, Some("https://music.example.com")).as_deref(),
+            public_image_url(raw, Some("https://music.example.com"), CoverMode::Navidrome)
+                .as_deref(),
             Some("https://music.example.com/share/img/eyJhbGciOiJ9.sig?size=600")
         );
     }
@@ -1472,7 +1969,7 @@ mod tests {
             "http://nas.local:4533/share/img/tok",
             "http://[::1]:4533/share/img/tok",
         ] {
-            assert_eq!(public_image_url(raw, None), None, "{raw}");
+            assert_eq!(public_image_url(raw, None, CoverMode::Navidrome), None, "{raw}");
         }
     }
 
@@ -1481,12 +1978,128 @@ mod tests {
         // A Navidrome with a BaseUrl configured returns a usable URL straight
         // away; forcing a rewrite there would break a working setup.
         let raw = "https://music.example.com/share/img/tok?size=600";
-        assert_eq!(public_image_url(raw, None).as_deref(), Some(raw));
+        assert_eq!(
+            public_image_url(raw, None, CoverMode::Navidrome).as_deref(),
+            Some(raw)
+        );
         // Even when a public origin is configured, the path is preserved.
         assert_eq!(
-            public_image_url(raw, Some("https://other.example.com")).as_deref(),
+            public_image_url(raw, Some("https://other.example.com"), CoverMode::Navidrome)
+                .as_deref(),
             Some("https://other.example.com/share/img/tok?size=600")
         );
+    }
+
+    #[test]
+    fn server_mode_never_falls_back_to_navidrome() {
+        // The whole reason `serve-covers` exists is that Navidrome is *not*
+        // exposed. Falling back to its own URL here would hand Discord an
+        // address we already know it cannot reach.
+        assert_eq!(
+            public_image_url(
+                "https://music.example.com/share/img/tok?size=600",
+                None,
+                CoverMode::Server
+            ),
+            None
+        );
+        // A configured origin is still used — it is the cover server's.
+        assert_eq!(
+            public_image_url(
+                "http://localhost:4533/share/img/tok?size=600",
+                Some("https://covers.example.com"),
+                CoverMode::Server
+            )
+            .as_deref(),
+            Some("https://covers.example.com/share/img/tok?size=600")
+        );
+    }
+
+    // ---- Cover mode -----------------------------------------------------
+
+    #[test]
+    fn the_default_cover_mode_is_off() {
+        // No covers unless asked for: the common setup has no public endpoint,
+        // and it must work out of the box without one.
+        for raw in ["", "   ", "off", " OFF ", "Off"] {
+            assert_eq!(CoverMode::parse(raw), Ok(CoverMode::Off), "raw: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn the_documented_cover_modes_parse() {
+        for (raw, expected) in [
+            ("navidrome", CoverMode::Navidrome),
+            ("NaviDrome", CoverMode::Navidrome),
+            ("server", CoverMode::Server),
+            ("  server  ", CoverMode::Server),
+        ] {
+            assert_eq!(CoverMode::parse(raw), Ok(expected), "raw: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_cover_mode_is_rejected() {
+        // A typo must not quietly fall back to `off`: that is precisely the
+        // silent failure this variable exists to prevent.
+        for raw in ["navidrom", "auto", "true", "cloudflare", "navidrome,"] {
+            let err = CoverMode::parse(raw).unwrap_err();
+            assert!(err.contains("off, navidrome, server"), "raw: {raw:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn a_first_run_without_covers_is_a_hint_not_a_failure() {
+        // The single most important distinction in this function: someone who
+        // has done nothing wrong must not be shown a warning on their first
+        // start, or they will read it as the program being broken.
+        let (severity, line) = cover_status(CoverMode::Off, None);
+        assert_eq!(severity, CoverStatus::Info, "line: {line}");
+        assert!(line.contains("COVER_MODE"), "line: {line}");
+        assert!(!line.starts_with("Warning"), "line: {line}");
+    }
+
+    #[test]
+    fn covers_that_were_asked_for_but_cannot_work_warn() {
+        // Two ways to ask for covers and not get them — both must be
+        // unmissable, because both leave the operator expecting an image.
+        let (severity, line) = cover_status(CoverMode::Server, None);
+        assert_eq!(severity, CoverStatus::Warning, "line: {line}");
+        assert!(line.contains("NAVIDROME_PUBLIC_URL"), "line: {line}");
+
+        let (severity, line) = cover_status(CoverMode::Off, Some("https://covers.example.com"));
+        assert_eq!(severity, CoverStatus::Warning, "line: {line}");
+        assert!(line.contains("COVER_MODE"), "line: {line}");
+    }
+
+    #[test]
+    fn a_mode_that_will_work_reports_where_covers_come_from() {
+        for (mode, origin, needle) in [
+            (
+                CoverMode::Navidrome,
+                "https://music.example.com",
+                "from Navidrome at https://music.example.com",
+            ),
+            (
+                CoverMode::Server,
+                "https://covers.example.com",
+                "from the cover server at https://covers.example.com",
+            ),
+        ] {
+            let (severity, line) = cover_status(mode, Some(origin));
+            assert_eq!(severity, CoverStatus::Info, "line: {line}");
+            assert!(line.contains(needle), "line: {line}");
+        }
+    }
+
+    #[test]
+    fn navidrome_mode_without_an_origin_is_not_a_warning() {
+        // A Navidrome with a `BaseUrl` already returns reachable URLs, so this
+        // configuration can genuinely work — crying warning here would be a
+        // false alarm, and false alarms teach people to ignore real ones.
+        let (severity, line) = cover_status(CoverMode::Navidrome, None);
+        assert_eq!(severity, CoverStatus::Info, "line: {line}");
+        assert!(line.contains("publicly reachable"), "line: {line}");
     }
 
     #[test]
@@ -1533,5 +2146,98 @@ mod tests {
             Some("https://music.example.com/share/img/tok")
         );
         assert!(json["state"].as_str().unwrap().starts_with("⏸ Paused"));
+    }
+
+    // ---- Cover server ---------------------------------------------------
+
+    #[test]
+    fn the_cover_server_accepts_the_urls_it_hands_out() {
+        // Exactly what Navidrome produces and the bridge publishes.
+        let token = "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImFsLTRiIn0.sig";
+
+        assert_eq!(
+            cover_upstream_path(&format!("/share/img/{}?size=600", token)),
+            Some(format!("/share/img/{}?size=600", token))
+        );
+        assert_eq!(
+            cover_upstream_path(&format!("/share/img/{}", token)),
+            Some(format!("/share/img/{}", token))
+        );
+        // Both prefixes: it is not obvious whether Funnel forwards or strips
+        // the mount path, so both must work.
+        assert_eq!(
+            cover_upstream_path(&format!("/img/{}", token)),
+            Some(format!("/share/img/{}", token))
+        );
+        assert_eq!(
+            cover_upstream_path(&format!("/img/{}?size=1200", token)),
+            Some(format!("/share/img/{}?size=1200", token))
+        );
+    }
+
+    #[test]
+    fn the_cover_server_refuses_everything_else() {
+        // This is the whole security boundary: a request must not be able to
+        // steer the upstream fetch onto another Navidrome endpoint, out of the
+        // share directory, or into a header.
+        for target in [
+            // Not our endpoint — this is what keeps the login page and the API
+            // off the public internet.
+            "/",
+            "/rest/getNowPlaying",
+            "/login",
+            "/share/img/../../rest/getNowPlaying",
+            "/share/img/",
+            // Escape attempts.
+            "/share/img/..%2f..%2fetc/passwd",
+            "/share/img/a/b",
+            "/share/img/tok#frag",
+            // Absolute-form target naming an origin we did not choose.
+            "http://evil.example/share/img/tok",
+            "https://evil.example/share/img/tok",
+            // Header injection through the request line.
+            "/share/img/tok\r\nX-Injected: 1",
+            "/share/img/tok with space",
+            // Query we would not have authorised: names another origin, so it
+            // is refused (well-formed key=value pairs are forwarded — the path
+            // is pinned, and upstream ignores what it does not recognise).
+            "/share/img/tok?next=http://evil.example",
+            "/share/img/tok?size=600/../rest/ping",
+        ] {
+            assert_eq!(
+                cover_upstream_path(target),
+                None,
+                "should have been refused: {:?}",
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn the_cover_server_refuses_a_bad_method() {
+        // A server that proxies only artwork must not become a write surface.
+        let server = CoverServer::new("http://localhost:4533".into());
+        let response = String::from_utf8(server.respond("POST", "/share/img/tok")).unwrap();
+        assert!(response.starts_with("HTTP/1.1 405"), "{}", &response[..40]);
+
+        let response = String::from_utf8(server.respond("DELETE", "/share/img/tok")).unwrap();
+        assert!(response.starts_with("HTTP/1.1 405"), "{}", &response[..40]);
+    }
+
+    #[test]
+    fn the_cover_server_answers_404_without_touching_upstream() {
+        // Nothing is listening on this port, so any upstream round-trip would
+        // fail loudly rather than fast — proving the refusal happens first.
+        let server = CoverServer::new("http://127.0.0.1:9".into());
+
+        for target in ["/", "/rest/ping", "/share/img/..%2f..%2fetc/passwd"] {
+            let response = String::from_utf8(server.respond("GET", target)).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 404"),
+                "{} -> {}",
+                target,
+                &response[..15.min(response.len())]
+            );
+        }
     }
 }
