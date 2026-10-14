@@ -545,6 +545,9 @@ fn is_locally_only(origin: &str) -> bool {
 /// missing image with no explanation, which is worse than no image at all.
 fn public_image_url(raw: &str, public_url: Option<&str>, mode: CoverMode) -> Option<String> {
     let (origin, rest) = split_origin(raw)?;
+    // Applied on the way through, in every mode: Discord's activity card is a
+    // square box, and this costs one query parameter.
+    let rest = as_square(rest);
 
     if let Some(public) = public_url {
         return Some(format!("{}{}", public, rest));
@@ -557,8 +560,22 @@ fn public_image_url(raw: &str, public_url: Option<&str>, mode: CoverMode) -> Opt
     if is_locally_only(origin) {
         None
     } else {
-        Some(raw.to_string())
+        // `origin` and `rest` came out of splitting `raw`, so this is the same
+        // string with the crop appended.
+        Some(format!("{}{}", origin, rest))
     }
+}
+
+/// Asks Navidrome to crop artwork to a square.
+///
+/// Discord renders `large_image` inside a square box and recommends square
+/// assets of its own, while Navidrome hands back covers at the album's native
+/// aspect — 1200x675 for the album playing when this was written, which
+/// letterboxes into the card. Navidrome does the crop itself, so the only cost
+/// is a query parameter and one decoder pass over an image it already had.
+fn as_square(path_and_query: &str) -> String {
+    let separator = if path_and_query.contains('?') { '&' } else { '?' };
+    format!("{}{}square=true", path_and_query, separator)
 }
 
 /// Resolves a cover image for a track.
@@ -588,9 +605,9 @@ fn fetch_cover(client: &Client, config: &Config, track_id: &str) -> Result<Optio
         &format!("id={}", encode_query(track_id)),
     )?;
 
-    // Prefer the largest variant: it is a square PNG of a few tens of KB, and
-    // Discord downscales it anyway. Fall back to medium/small so an album with
-    // only a thumbnail still shows something.
+    // Prefer the largest variant, already square once `as_square` has had its
+    // say. Discord downscales to the card anyway; the fallbacks exist so an
+    // album with only a thumbnail still shows something rather than nothing.
     let raw = body["subsonic-response"]["albumInfo"]
         .get("largeImageUrl")
         .or_else(|| body["subsonic-response"]["albumInfo"].get("mediumImageUrl"))
@@ -2078,7 +2095,7 @@ mod tests {
         assert_eq!(
             public_image_url(raw, Some("https://music.example.com"), CoverMode::Navidrome)
                 .as_deref(),
-            Some("https://music.example.com/share/img/eyJhbGciOiJ9.sig?size=600")
+            Some("https://music.example.com/share/img/eyJhbGciOiJ9.sig?size=600&square=true")
         );
     }
 
@@ -2101,19 +2118,20 @@ mod tests {
     }
 
     #[test]
-    fn a_already_public_navidrome_url_is_left_alone() {
-        // A Navidrome with a BaseUrl configured returns a usable URL straight
-        // away; forcing a rewrite there would break a working setup.
+    fn a_already_public_navidrome_url_keeps_its_origin() {
+        // A Navidrome with a BaseUrl configured returns a usable origin straight
+        // away; forcing a rewrite there would break a working setup. The crop
+        // is still requested.
         let raw = "https://music.example.com/share/img/tok?size=600";
         assert_eq!(
             public_image_url(raw, None, CoverMode::Navidrome).as_deref(),
-            Some(raw)
+            Some("https://music.example.com/share/img/tok?size=600&square=true")
         );
         // Even when a public origin is configured, the path is preserved.
         assert_eq!(
             public_image_url(raw, Some("https://other.example.com"), CoverMode::Navidrome)
                 .as_deref(),
-            Some("https://other.example.com/share/img/tok?size=600")
+            Some("https://other.example.com/share/img/tok?size=600&square=true")
         );
     }
 
@@ -2138,8 +2156,20 @@ mod tests {
                 CoverMode::Server
             )
             .as_deref(),
-            Some("https://covers.example.com/share/img/tok?size=600")
+            Some("https://covers.example.com/share/img/tok?size=600&square=true")
         );
+    }
+
+    #[test]
+    fn the_crop_is_requested_whether_or_not_there_is_a_query() {
+        // Navidrome's URL always carries `size`, but the separator has to be
+        // chosen rather than assumed — a bare `&` would make the path itself
+        // unparseable and the signed token unrecoverable.
+        assert_eq!(
+            as_square("/share/img/tok?size=1200"),
+            "/share/img/tok?size=1200&square=true"
+        );
+        assert_eq!(as_square("/share/img/tok"), "/share/img/tok?square=true");
     }
 
     // ---- Cover mode -----------------------------------------------------

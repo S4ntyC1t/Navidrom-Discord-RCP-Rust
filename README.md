@@ -127,6 +127,13 @@ Both real modes also want `NAVIDROME_PUBLIC_URL` — the origin Discord should
 fetch from. The bridge rewrites the cover URLs it is handed to that origin,
 leaving the signed path intact.
 
+Covers are also requested **square**. Discord's activity card is a square box
+and its own documentation recommends square assets, while Navidrome returns
+artwork at the album's native aspect — 1200x675, say — which letterboxes into
+the card with bars on two sides. The crop is a `square=true` query parameter
+Navidrome applies itself, so it happens at the source rather than adding an
+image decoder to this bridge.
+
 #### Serving covers without exposing Navidrome
 
 `COVER_MODE=server` pairs the bridge with a second process, `serve-covers`,
