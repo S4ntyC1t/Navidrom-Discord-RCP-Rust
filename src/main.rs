@@ -545,9 +545,6 @@ fn is_locally_only(origin: &str) -> bool {
 /// missing image with no explanation, which is worse than no image at all.
 fn public_image_url(raw: &str, public_url: Option<&str>, mode: CoverMode) -> Option<String> {
     let (origin, rest) = split_origin(raw)?;
-    // Applied on the way through, in every mode: Discord's activity card is a
-    // square box, and this costs one query parameter.
-    let rest = as_square(rest);
 
     if let Some(public) = public_url {
         return Some(format!("{}{}", public, rest));
@@ -560,22 +557,8 @@ fn public_image_url(raw: &str, public_url: Option<&str>, mode: CoverMode) -> Opt
     if is_locally_only(origin) {
         None
     } else {
-        // `origin` and `rest` came out of splitting `raw`, so this is the same
-        // string with the crop appended.
-        Some(format!("{}{}", origin, rest))
+        Some(raw.to_string())
     }
-}
-
-/// Asks Navidrome to crop artwork to a square.
-///
-/// Discord renders `large_image` inside a square box and recommends square
-/// assets of its own, while Navidrome hands back covers at the album's native
-/// aspect — 1200x675 for the album playing when this was written, which
-/// letterboxes into the card. Navidrome does the crop itself, so the only cost
-/// is a query parameter and one decoder pass over an image it already had.
-fn as_square(path_and_query: &str) -> String {
-    let separator = if path_and_query.contains('?') { '&' } else { '?' };
-    format!("{}{}square=true", path_and_query, separator)
 }
 
 /// Resolves a cover image for a track.
@@ -605,9 +588,9 @@ fn fetch_cover(client: &Client, config: &Config, track_id: &str) -> Result<Optio
         &format!("id={}", encode_query(track_id)),
     )?;
 
-    // Prefer the largest variant, already square once `as_square` has had its
-    // say. Discord downscales to the card anyway; the fallbacks exist so an
-    // album with only a thumbnail still shows something rather than nothing.
+    // Prefer the largest variant: it is a few hundred KB, and Discord
+    // downscales it anyway. Fall back to medium/small so an album with only a
+    // thumbnail still shows something rather than nothing.
     let raw = body["subsonic-response"]["albumInfo"]
         .get("largeImageUrl")
         .or_else(|| body["subsonic-response"]["albumInfo"].get("mediumImageUrl"))
@@ -1256,9 +1239,19 @@ impl CoverServer {
             return None;
         }
 
+        // Crop to the square Discord's card expects, over bytes that are
+        // already in hand. `None` means "leave it alone", not "drop it": a
+        // cover that arrives uncropped is a lesser evil than a missing one.
+        let (bytes, content_type) = match to_square(&bytes) {
+            Some((cropped, encoded_as)) if cropped.len() <= COVER_MAX_BYTES => {
+                (Arc::new(cropped), encoded_as.to_string())
+            }
+            _ => (Arc::new(bytes.to_vec()), media_type),
+        };
+
         Some(CoverCacheEntry {
-            bytes: Arc::new(bytes.to_vec()),
-            content_type: media_type,
+            bytes,
+            content_type,
         })
     }
 
@@ -1364,6 +1357,61 @@ fn allowed_cover_type(header: &str) -> Option<String> {
     ALLOWED_COVER_TYPES
         .contains(&media_type.as_str())
         .then_some(media_type)
+}
+
+/// Crops an image to a centred square, returning the new bytes and the media
+/// type they were encoded as.
+///
+/// Discord renders `large_image` inside a square box and recommends square
+/// assets of its own, while Navidrome returns covers at the album's native
+/// aspect — 1200x675 for the album playing when this was written. Navidrome
+/// cannot crop: its `square=true` parameter pads with black bars, which is the
+/// original letterboxing with an extra round-trip added. So the crop happens
+/// here, over bytes that are already in memory.
+///
+/// Returns `None` when there is nothing to do — the image is already square,
+/// has no pixels, or is in a format this build cannot decode — and the caller
+/// serves the original untouched. A cover that arrives uncropped is a lesser
+/// evil than no cover at all.
+fn to_square(bytes: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    let source = image::load_from_memory(bytes).ok()?;
+
+    let (width, height) = (source.width(), source.height());
+    let side = width.min(height);
+    if side == 0 || width == height {
+        return None;
+    }
+
+    // Decided from the source, not from the crop: `crop_imm` hands back an
+    // RGBA buffer whatever went in, so asking it about alpha would say yes
+    // every time and force every cover through PNG.
+    let had_alpha = source.color().has_alpha();
+
+    let x = (width - side) / 2;
+    let y = (height - side) / 2;
+    let cropped: image::DynamicImage =
+        image::imageops::crop_imm(&source, x, y, side, side).to_image().into();
+
+    let mut encoded = Vec::new();
+    let encoded_as = if had_alpha {
+        // PNG, because JPEG has nowhere to put alpha and would flatten it to
+        // black — which is the very failure this crop exists to avoid.
+        cropped
+            .write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png)
+            .ok()?;
+        "image/png"
+    } else {
+        // JPEG for opaque art: what a photo compresses to, and what Navidrome
+        // itself sends for resized covers. Converted explicitly rather than
+        // handed through as a DynamicImage, whose color type is not ours to
+        // guess at.
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85)
+            .encode_image(&cropped.to_rgb8())
+            .ok()?;
+        "image/jpeg"
+    };
+
+    Some((encoded, encoded_as))
 }
 
 fn image_response(entry: &CoverCacheEntry, head_only: bool) -> Vec<u8> {
@@ -2095,7 +2143,7 @@ mod tests {
         assert_eq!(
             public_image_url(raw, Some("https://music.example.com"), CoverMode::Navidrome)
                 .as_deref(),
-            Some("https://music.example.com/share/img/eyJhbGciOiJ9.sig?size=600&square=true")
+            Some("https://music.example.com/share/img/eyJhbGciOiJ9.sig?size=600")
         );
     }
 
@@ -2118,20 +2166,19 @@ mod tests {
     }
 
     #[test]
-    fn a_already_public_navidrome_url_keeps_its_origin() {
-        // A Navidrome with a BaseUrl configured returns a usable origin straight
-        // away; forcing a rewrite there would break a working setup. The crop
-        // is still requested.
+    fn a_already_public_navidrome_url_is_left_alone() {
+        // A Navidrome with a BaseUrl configured returns a usable URL straight
+        // away; forcing a rewrite there would break a working setup.
         let raw = "https://music.example.com/share/img/tok?size=600";
         assert_eq!(
             public_image_url(raw, None, CoverMode::Navidrome).as_deref(),
-            Some("https://music.example.com/share/img/tok?size=600&square=true")
+            Some(raw)
         );
         // Even when a public origin is configured, the path is preserved.
         assert_eq!(
             public_image_url(raw, Some("https://other.example.com"), CoverMode::Navidrome)
                 .as_deref(),
-            Some("https://other.example.com/share/img/tok?size=600&square=true")
+            Some("https://other.example.com/share/img/tok?size=600")
         );
     }
 
@@ -2156,20 +2203,8 @@ mod tests {
                 CoverMode::Server
             )
             .as_deref(),
-            Some("https://covers.example.com/share/img/tok?size=600&square=true")
+            Some("https://covers.example.com/share/img/tok?size=600")
         );
-    }
-
-    #[test]
-    fn the_crop_is_requested_whether_or_not_there_is_a_query() {
-        // Navidrome's URL always carries `size`, but the separator has to be
-        // chosen rather than assumed — a bare `&` would make the path itself
-        // unparseable and the signed token unrecoverable.
-        assert_eq!(
-            as_square("/share/img/tok?size=1200"),
-            "/share/img/tok?size=1200&square=true"
-        );
-        assert_eq!(as_square("/share/img/tok"), "/share/img/tok?square=true");
     }
 
     // ---- Cover mode -----------------------------------------------------
@@ -2486,6 +2521,85 @@ mod tests {
             0,
             "a panicking handler leaked its connection slot"
         );
+    }
+
+    // ---- Cropping -------------------------------------------------------
+
+    /// Encodes an image for a test, so the fixtures need no files on disk.
+    fn png_of(image: &image::DynamicImage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("encode png");
+        bytes
+    }
+
+    #[test]
+    fn a_wide_cover_is_cropped_to_a_centred_square() {
+        // 200x100, white through the middle 60 columns (x 70..130) and black
+        // at both edges. A centred crop spans x 50..150, so it must contain
+        // black at its own left and right with white in between — a crop
+        // anchored to either edge would not.
+        let mut wide = image::RgbImage::new(200, 100);
+        for (x, _, pixel) in wide.enumerate_pixels_mut() {
+            let white = (70..130).contains(&x);
+            *pixel = image::Rgb(if white { [255u8, 255, 255] } else { [0, 0, 0] });
+        }
+
+        let (cropped, encoded_as) =
+            to_square(&png_of(&image::DynamicImage::ImageRgb8(wide))).expect("cropped");
+
+        // Opaque source, so JPEG — the format a photo compresses to.
+        assert_eq!(encoded_as, "image/jpeg");
+
+        let out = image::load_from_memory(&cropped).expect("decode the crop");
+        assert_eq!((out.width(), out.height()), (100, 100), "not a square");
+
+        // JPEG is lossy, so the thresholds have slack.
+        let rgb = out.to_rgb8();
+        for (x, expect) in [(5u32, "dark"), (45, "light"), (95, "dark")] {
+            let [r, g, b] = rgb.get_pixel(x, 50).0;
+            match expect {
+                "dark" => assert!(r < 40 && g < 40 && b < 40, "x={x} came out {r} {g} {b}"),
+                _ => assert!(r > 215 && g > 215 && b > 215, "x={x} came out {r} {g} {b}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_already_square_cover_is_left_alone() {
+        // Nothing to crop, and re-encoding an image that is already what we
+        // want would only lose quality for nothing.
+        let square = image::DynamicImage::ImageRgb8(image::RgbImage::new(80, 80));
+        assert_eq!(to_square(&png_of(&square)), None);
+    }
+
+    #[test]
+    fn an_undecodable_cover_is_served_as_it_arrived() {
+        // A format this build cannot decode must not become a missing cover —
+        // `None` means "leave it alone", and the caller keeps the original.
+        assert_eq!(to_square(b"not an image at all"), None);
+        assert_eq!(to_square(b""), None);
+    }
+
+    #[test]
+    fn transparency_survives_the_crop() {
+        // JPEG has nowhere to put alpha and would flatten it to black, which
+        // is the letterboxing this crop exists to avoid.
+        let mut wide = image::RgbaImage::new(200, 100);
+        for (x, _, pixel) in wide.enumerate_pixels_mut() {
+            *pixel = image::Rgba([200u8, 10, 10, if (70..130).contains(&x) { 255 } else { 0 }]);
+        }
+
+        let (cropped, encoded_as) =
+            to_square(&png_of(&image::DynamicImage::ImageRgba8(wide))).expect("cropped");
+
+        assert_eq!(encoded_as, "image/png");
+        let out = image::load_from_memory(&cropped).expect("decode the crop");
+        assert_eq!(out.color(), image::ColorType::Rgba8, "alpha was flattened away");
+        // Inside the crop, x 50..150: opaque at the middle, clear at the edges.
+        assert_eq!(out.to_rgba8().get_pixel(50, 50).0[3], 255);
+        assert_eq!(out.to_rgba8().get_pixel(5, 50).0[3], 0);
     }
 
     // ---- Host reachability ---------------------------------------------

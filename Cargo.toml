@@ -14,6 +14,10 @@ serde_json = "1.0"
 # Subsonic token authentication (t = md5(password + salt)) is mandated by the
 # Subsonic API spec; this is the reference implementation of that one hash.
 md5 = "0.7"
+# Decoding only the formats Navidrome serves covers in, so that `serve-covers`
+# can crop them to the square Discord's activity card expects. Navidrome
+# cannot: its `square=true` pads with black bars instead of cropping.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [profile.release]
 strip = true

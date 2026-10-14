@@ -127,12 +127,20 @@ Both real modes also want `NAVIDROME_PUBLIC_URL` — the origin Discord should
 fetch from. The bridge rewrites the cover URLs it is handed to that origin,
 leaving the signed path intact.
 
-Covers are also requested **square**. Discord's activity card is a square box
-and its own documentation recommends square assets, while Navidrome returns
-artwork at the album's native aspect — 1200x675, say — which letterboxes into
-the card with bars on two sides. The crop is a `square=true` query parameter
-Navidrome applies itself, so it happens at the source rather than adding an
-image decoder to this bridge.
+Covers are also **cropped to a square** here. Discord renders `large_image`
+inside a square box and recommends square assets of its own, while Navidrome
+returns artwork at the album's native aspect — 1200x675, say — which
+letterboxes into the card with bars on two sides.
+
+Navidrome cannot do this for you. Its `square=true` parameter pads with black
+bars instead of cropping, which is the same letterboxing with an extra
+round-trip, so `serve-covers` crops the image itself: centre-cropped to the
+long edge's short side, then re-encoded as JPEG (or PNG when the source has
+alpha, since JPEG has nowhere to put it). Doing it here also shrinks what
+crosses the wire — a 1200x675 cover of 334 KB went out as an 87 KB square.
+
+This applies to `server` mode only. In `navidrome` mode Discord fetches
+straight from Navidrome, so nothing is in the path to crop.
 
 #### Serving covers without exposing Navidrome
 
@@ -208,6 +216,10 @@ rather than configurable:
 Non-artwork paths are refused **before** any upstream request, so the endpoint
 cannot be used to browse Navidrome. Only `png`, `jpeg`, `webp` and `gif` are
 republished — `image/*` would include `image/svg+xml`, which carries scripts.
+
+The square crop re-encodes as JPEG or PNG, so a cover in a format this build
+cannot decode is passed through untouched rather than dropped: an uncropped
+image is a lesser evil than no image.
 
 **The startup line tells you which of three situations you are in**, and they
 are deliberately worded differently:
